@@ -2076,6 +2076,27 @@ const TL_UPSCALE_HOVER = "rgba(38,132,144,0.95)";
 const TL_UPSCALE_CLIP = "rgba(28,106,116,0.92)";
 const TL_UPSCALE_CLIP_SEL = "rgba(36,158,170,1)";
 const TL_UPSCALE_EDGE = "#4fd6dd";
+
+// M2: refine chain cache and loader
+const refineChainCache = new Map();
+async function loadRefineChain(clip) {
+    if (refineChainCache.has(clip)) return refineChainCache.get(clip);
+    try {
+        const resp = await api.fetchApi("/obvpm/h3/refine_chain", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ clip }),
+        });
+        const data = await resp.json();
+        const chain = Array.isArray(data.chain) ? data.chain : [];
+        refineChainCache.set(clip, chain);
+        return chain;
+    } catch (err) {
+        refineChainCache.set(clip, []);
+        return [];
+    }
+}
+
 // sibling-widget channel: Timeline nodes register {folder, offer,
 // forget} here so the Result Preview can hand them a good take or
 // report a deleted one. Frontend-only on purpose -- the graph stays
@@ -3765,6 +3786,7 @@ app.registerExtension({
             // the one that needs no word -- naming both modes made the
             // button re-label itself on every click, which reads as the
             // control moving rather than the state changing.
+            let refreshTakesBtn = null;
             const runModeBtn = mkBtn("upscale", "");
             // the header's wide-button width, shared with ▶ quick,
             // ▶ full and export: they are the row's landmarks, and a
@@ -3931,15 +3953,38 @@ app.registerExtension({
             });
             paintLoop();
 
+            // Reload refine chains without waiting for the Comfy job or
+            // a browser refresh, so a finished pass 1 shows up immediately.
+            refreshTakesBtn = mkBtn("refresh",
+                "Reload upscale takes. Use this when a pass finishes "
+                + "and the dropdown or preview has not caught up.");
+            refreshTakesBtn.addEventListener("click", () => {
+                refineChainCache.clear();
+                void refresh();
+            });
             header.append(quickBtn, fullBtn, stateChip, snapBtn, loopBtn,
                           seamBtn, zoomOutBtn, zoomInBtn,
-                          fitBtn, addBtn, editBtn, exportBtn, runModeBtn);
+                          fitBtn, addBtn, editBtn, exportBtn,
+                          refreshTakesBtn, runModeBtn);
             // "next run" config bar: reserved space right below the
             // strip, ALWAYS visible -- states what the pin_specs output
             // will do (root generation vs extend/prepend) and carries
             // the pin options (window cycle, clear). Framed as a
             // CONTROL panel; colors re-applied per render (theme-live).
             const nextRunRow = document.createElement("div");
+            // M2: refined-source hint (display only, never written to sequence)
+            const refineHint = document.createElement("span");
+            refineHint.style.cssText = "font:9px sans-serif;color:#6a6;margin-left:8px;flex-shrink:1;overflow:hidden;text-overflow:ellipsis;";
+            function refreshRefineHint() {
+                const active = node.obvpmRefineActive || {};
+                const parts = Object.entries(active)
+                    .filter(([, src]) => src && src !== "base")
+                    .map(([clip, src]) => clip.split("/").pop().replace(/\.mp4$/, "") + ":" + src);
+                refineHint.textContent = parts.length ? "· " + parts.join(" ") : "";
+            }
+            refreshRefineHint();
+            node._obvpmRefreshRefineHint = refreshRefineHint;
+            nextRunRow.appendChild(refineHint);
             tlSelectable(nextRunRow);
             Object.assign(nextRunRow.style, {
                 // HARD-FIXED height: content changes (buttons
@@ -3992,6 +4037,23 @@ app.registerExtension({
                 psWidget.hidden = true;
                 (psWidget.options ??= {}).hidden = true;
             }
+            // M2 polish: persist refine source choices inside pin_state JSON
+            function loadRefineActive() {
+                try {
+                    const raw = psWidget?.value;
+                    if (!raw) return {};
+                    const st = JSON.parse(raw);
+                    return (st && st.refine_active) || {};
+                } catch { return {}; }
+            }
+            function saveRefineActive(map) {
+                if (!psWidget) return;
+                let st = {};
+                try { st = JSON.parse(psWidget.value || "{}") || {}; } catch {}
+                st.refine_active = map;
+                psWidget.value = JSON.stringify(st);
+            }
+            node.obvpmRefineActive = loadRefineActive();
             // The raw sequence textarea is hidden too (the strip IS the
             // sequence UI); the ✎ button pops it up for hand editing.
             seqWidget.hidden = true;
@@ -4401,7 +4463,7 @@ app.registerExtension({
                 // keeps mkBtn's hardcoded dark and reads as a foreign
                 // control on a light theme.
                 for (const el of [picker, addBtn, editBtn, quickBtn,
-                                  fullBtn, exportBtn, seamBtn,
+                                  fullBtn, exportBtn, refreshTakesBtn, seamBtn,
                                   zoomOutBtn, zoomInBtn, fitBtn]) {
                     el.style.background = PAL.rest;
                     el.style.borderColor = PAL.edge;
@@ -4556,7 +4618,7 @@ app.registerExtension({
                 strip.scrollLeft = Math.max(
                     0, strip.scrollLeft + (frameToX(at) - ax));
                 drawRuler();
-                drawLinks(lastEntries);
+                drawLinks(lastEntries); paintRefineSeams(lastEntries);
                 setPlayhead(displayFrame() ?? heldFrame);
             }
             // Re-widths what is already on screen. Cheaper than a full
@@ -4710,7 +4772,7 @@ app.registerExtension({
                 applyScale();
                 strip.scrollLeft = 0;
                 drawRuler();
-                drawLinks(lastEntries);
+                drawLinks(lastEntries); paintRefineSeams(lastEntries);
                 setPlayhead(displayFrame() ?? heldFrame);
             });
 
@@ -4866,7 +4928,7 @@ app.registerExtension({
             const rulerRO = new ResizeObserver(
                 () => requestAnimationFrame(() => {
                     drawRuler();
-                    drawLinks(lastEntries); // zones sit at computed x
+                    drawLinks(lastEntries); paintRefineSeams(lastEntries); // zones sit at computed x
                 }));
             rulerRO.observe(timelineWrap);
             let themeTimer = null;
@@ -5975,20 +6037,72 @@ app.registerExtension({
                 }
                 return out;
             }
+            async function sequenceWithTakes(seq) {
+                // Rewrite clip lines to the active refined take so the
+                // full preview shows the selected upscale, not the base.
+                const active = node.obvpmRefineActive || {};
+                const lines = String(seq || "").split("\n");
+                const out = [];
+                for (const line of lines) {
+                    const m = line.match(/^(\S+)(.*)$/);
+                    if (!m) { out.push(line); continue; }
+                    const clip = m[1], rest = m[2] || "";
+                    // loose key match (path may differ slightly)
+                    let choice = active[clip];
+                    if (!choice) {
+                        const base = clip.split("/").pop();
+                        for (const [k, v] of Object.entries(active)) {
+                            if (k === clip || k.endsWith("/" + base) || k.endsWith(base)) {
+                                choice = v; break;
+                            }
+                        }
+                    }
+                    if (!choice || choice === "base") { out.push(line); continue; }
+                    let chain = refineChainCache.get(clip);
+                    if (!chain) {
+                        try { chain = await loadRefineChain(clip); } catch { chain = []; }
+                    }
+                    const [ps, is] = String(choice).split(":");
+                    const cands = (chain || []).filter(e => String(e.pass) === String(ps));
+                    const ent = cands[parseInt(is, 10)] || cands[cands.length - 1];
+                    if (!ent?.take) { out.push(line); continue; }
+                    const dir = clip.includes("/") ? clip.slice(0, clip.lastIndexOf("/") + 1) : "";
+                    // The timeline's trim lives on the playlist, not in
+                    // the line. Carry the base clip's cut onto the take
+                    // so full preview and export show the same range.
+                    let cut = rest;
+                    if (!/ @ /.test(rest)) {
+                        const item = (playlist || []).find((it) =>
+                            it.clip === clip || it._baseClip === clip);
+                        if (item && (item.enter || item.exit != null)) {
+                            const a = item.enter || 0;
+                            const b = item.exit;
+                            cut = (b != null ? ` @ ${a}..${b}` : ` @ ${a}`) + rest;
+                        }
+                    }
+                    out.push(dir + ent.take + cut);
+                }
+                const result = out.join("\n");
+                console.log("full preview sequence:", result);
+                return result;
+            }
             async function previewApi(probe) {
                 // nothing on the strip = nothing to build. Returning
                 // null rather than asking keeps an empty timeline from
                 // refusing on every repaint; callers read it as "no
                 // preview", which is what an empty strip has.
                 if (!tlParseSequence(seqWidget.value).length) return null;
+                const seqForPreview = await sequenceWithTakes(seqWidget.value);
                 const resp = await api.fetchApi("/obvpm/h3/preview_cut", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        sequence: seqWidget.value, crf: crfValue(),
+                        sequence: seqForPreview, crf: crfValue(),
                         base_folder: folderValue(),
                         preview_filename:
                             widgetValue("preview_filename", ""),
+                        // cap preview encode; backend may ignore if unsupported
+                        preview_max_edge: 1280,
                         probe, ...fixOpts(),
                     }),
                 });
@@ -6016,11 +6130,12 @@ app.registerExtension({
                 exportBtn.textContent = "⏳ export";
                 progress.arm("preparing…");
                 try {
+                    const seqForExport = await sequenceWithTakes(seqWidget.value);
                     const resp = await api.fetchApi("/obvpm/h3/export", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
-                            sequence: seqWidget.value, crf: crfValue(),
+                            sequence: seqForExport, crf: crfValue(),
                             base_folder: folderValue(),
                             preview_filename:
                                 widgetValue("preview_filename", ""),
@@ -6442,6 +6557,53 @@ app.registerExtension({
                 return tlExtendParent(b)?.id === a.self_id ||
                        tlPrependChild(a)?.id === b.self_id;
             }
+
+            // M3.1: refine-compatibility ticks in the seam band
+            const refineSeamEls = [];
+            function paintRefineSeams(entries) {
+                refineSeamEls.forEach(el => el.remove());
+                refineSeamEls.length = 0;
+                if (!entries || !entries.length) return;
+                const active = node.obvpmRefineActive || {};
+                // the ladder top is the highest pass anywhere on the strip
+                let maxPass = 1;
+                for (const e of entries) {
+                    if (!e?.clip) continue;
+                    for (const c of (refineChainCache.get(e.clip) || [])) {
+                        maxPass = Math.max(maxPass, Number(c.pass) || 0);
+                    }
+                }
+                const passOf = (clip) => {
+                    const raw = active[clip];
+                    if (!raw || raw === "base") return 0;
+                    return Number(String(raw).split(":")[0]) || 0;
+                };
+                // white at base, green at the top pass, graded between
+                const colorFor = (pass) => {
+                    if (!pass) return "#d8dbe2";          // base: white
+                    if (pass >= maxPass) return "#3fa86a"; // top pass: green
+                    return "#e2b340";                      // a pass short of the top: yellow
+                };
+                entries.forEach((e, i) => {
+                    if (!e?.clip || e.gap != null) return;
+                    const block = blockEls[i];
+                    if (!block) return;
+                    const bar = document.createElement("div");
+                    Object.assign(bar.style, {
+                        position: "absolute", left: "0", right: "0",
+                        bottom: "0", height: "3px",
+                        background: colorFor(passOf(e.clip)),
+                        pointerEvents: "none", zIndex: "6",
+                    });
+                    bar.title = passOf(e.clip)
+                        ? `pass ${passOf(e.clip)} of ${maxPass}`
+                        : "base";
+                    block.appendChild(bar);
+                    refineSeamEls.push(bar);
+                });
+                return;
+            }
+
             function drawLinks(entries) {
                 linkEls.forEach((el) => el.remove());
                 linkEls = [];
@@ -8270,8 +8432,9 @@ app.registerExtension({
                                     : TL_COLORS.butt));
                     const pinSlot = document.createElement("span");
                     Object.assign(pinSlot.style, {
-                        width: "68px", flexShrink: "0",
+                        flexShrink: "0",
                         display: "inline-flex", alignItems: "center",
+                        gap: "4px",
                     });
                     if (pinnedRole) {
                         const pb = document.createElement("span");
@@ -8343,6 +8506,7 @@ app.registerExtension({
                             (ev) => ev.stopPropagation());
                         pinSlot.appendChild(ub);
                         block.dataset.obvpmUp = off ? "off" : "on";
+
                         if (off) {
                             // muted, like a muted node: greyed, dashed
                             block.style.opacity = "0.4";
@@ -8352,6 +8516,209 @@ app.registerExtension({
                             block.style.borderColor = "transparent";
                         }
                     }
+
+
+                        // M2: source selector (always attempted when chain exists)
+                        loadRefineChain(e.clip).then((chain) => {
+                            try { paintRefineSeams(lastEntries); } catch {}
+                            console.log('M2 chain for', e.clip, chain);
+                            if (!chain.length) console.warn('M2: no refine chain found for', e.clip);
+                            if (!chain.length) return;
+                            const sel = document.createElement("select");
+                            sel.title = "Preview source for this clip";
+                            Object.assign(sel.style, {
+                                height: "16px", font: "10px sans-serif",
+                                background: "#1a1a1a", color: "#fff",
+                                border: "1px solid #4fd6dd",
+                                borderRadius: "3px", marginLeft: "4px",
+                                maxWidth: "70px",
+                                cursor: "pointer",
+                            });
+                            sel.style.setProperty("color", "#fff", "important");
+                            sel.style.setProperty("background", "#1a1a1a", "important");
+                            sel.title = "Source for this clip (base / pass 1 / pass 2 / …)";
+                            sel.style.marginRight = "0";
+                            const baseOpt = document.createElement("option");
+                            baseOpt.value = "base";
+                            baseOpt.textContent = "base";
+                            sel.appendChild(baseOpt);
+                            // one option per pass; value is the pass number
+                            const byPass = new Map();
+                            chain.forEach((ent, k) => {
+                                const p = ent.pass || (k + 1);
+                                if (!byPass.has(p)) byPass.set(p, []);
+                                byPass.get(p).push({ idx: k, ent });
+                            });
+                            [...byPass.keys()].sort((a, b) => a - b).forEach((p) => {
+                                const o = document.createElement("option");
+                                o.value = String(p);
+                                o.textContent = `p${p}`;
+                                sel.appendChild(o);
+                            });
+                            // per-pass current take index (defaults to newest)
+                            node.obvpmPassTake = node.obvpmPassTake || {};
+                            const takesOf = (pass) => byPass.get(Number(pass)) || [];
+                            const currentTake = (pass) => {
+                                const list = takesOf(pass);
+                                if (!list.length) return null;
+                                const clipKey = e.clip;
+                                node.obvpmPassTake[clipKey] = node.obvpmPassTake[clipKey] || {};
+                                let i = node.obvpmPassTake[clipKey][pass];
+                                if (i == null || i < 0 || i >= list.length) i = list.length - 1;
+                                return list[i];
+                            };
+                            // show the current take name to the RIGHT of the dropdown
+                            const nameSpan = document.createElement("span");
+                            nameSpan.style.cssText = "display:flex;flex-direction:column;line-height:1.1;flex-shrink:0;";
+                            const takeLine = document.createElement("span");
+                            takeLine.style.cssText = "font:10px sans-serif;font-weight:600;";
+                            const fileLine = document.createElement("span");
+                            fileLine.style.cssText = "font:8px sans-serif;opacity:0.7;white-space:nowrap;";
+                            nameSpan.append(takeLine, fileLine);
+                            const updateName = () => {
+                                const v = sel.value;
+                                if (v === "base") {
+                                    takeLine.textContent = "";
+                                    fileLine.textContent = "";
+                                    nameSpan.title = "";
+                                    return;
+                                }
+                                const list = takesOf(v);
+                                const picked = currentTake(v);
+                                const idx = Math.max(0, list.indexOf(picked));
+                                takeLine.textContent = "Take " + (idx + 1);
+                                const file = picked?.ent.take ? picked.ent.take.replace(/\.mp4$/, "") : "";
+                                fileLine.textContent = file;
+                                nameSpan.title = picked?.ent.take || "";
+                            };
+                            sel.addEventListener("change", updateName);
+                            updateName();
+                            // cycle arrows + name, to the right of the dropdown
+                            // arrows cycle TAKES within the currently selected pass
+                            const arrowWrap = document.createElement("span");
+                            arrowWrap.style.cssText = "display:inline-flex;align-items:center;gap:4px;";
+                            const leftBtn = document.createElement("button");
+                            const rightBtn = document.createElement("button");
+                            leftBtn.type = rightBtn.type = "button";
+                            leftBtn.textContent = "◀";
+                            rightBtn.textContent = "▶";
+                            leftBtn.title = "previous take of this pass";
+                            rightBtn.title = "next take of this pass";
+                            [leftBtn, rightBtn].forEach(b => {
+                                b.style.cssText = "background:none;border:none;color:#aaa;cursor:pointer;font:11px sans-serif;padding:0 1px;";
+                                b.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                            });
+                            const updateArrows = () => {
+                                const list = takesOf(sel.value);
+                                const enabled = list.length > 1;
+                                leftBtn.style.opacity = rightBtn.style.opacity = enabled ? "1" : "0.3";
+                                leftBtn.style.pointerEvents = rightBtn.style.pointerEvents = enabled ? "" : "none";
+                            };
+                            const cycle = (dir) => {
+                                const list = takesOf(sel.value);
+                                if (list.length < 2) return;
+                                const ck = e.clip;
+                                node.obvpmPassTake[ck] = node.obvpmPassTake[ck] || {};
+                                let i = node.obvpmPassTake[ck][sel.value];
+                                if (i == null) i = list.length - 1;
+                                i = (i + dir + list.length) % list.length;
+                                node.obvpmPassTake[ck][sel.value] = i;
+                                updateName();
+                                // re-fire change so preview updates, but sel.value stays the pass
+                                sel.dispatchEvent(new Event("change"));
+                            };
+                            leftBtn.addEventListener("click", (ev) => { ev.stopPropagation(); cycle(-1); });
+                            rightBtn.addEventListener("click", (ev) => { ev.stopPropagation(); cycle(1); });
+                            sel.addEventListener("change", updateArrows);
+                            arrowWrap.appendChild(leftBtn);
+                            arrowWrap.appendChild(rightBtn);
+                            arrowWrap.appendChild(nameSpan);
+                            updateArrows();
+                            // restore previous choice, or default to highest pass
+                            const key = e.clip;
+                            const prev = node.obvpmRefineActive?.[key];
+                            let passToSelect = null;
+                            if (prev && prev !== "base") {
+                                const passPart = String(prev).split(":")[0];
+                                if ([...sel.options].some(o => o.value === passPart)) {
+                                    passToSelect = passPart;
+                                    // restore take index if present
+                                    const ti = String(prev).split(":")[1];
+                                    if (ti != null) { node.obvpmPassTake[key] = node.obvpmPassTake[key] || {}; node.obvpmPassTake[key][passPart] = parseInt(ti, 10); }
+                                }
+                            }
+                            if (passToSelect) {
+                                sel.value = passToSelect;
+                            } else if (prev === "base") {
+                                sel.value = "base";
+                            } else {
+                                const opts = [...sel.options].filter(o => o.value !== "base");
+                                if (opts.length) sel.value = opts[opts.length - 1].value;
+                            }
+                            sel.addEventListener("change", (ev) => {
+                                ev.stopPropagation();
+                                const choice = sel.value;
+                                node.obvpmRefineActive = node.obvpmRefineActive || {};
+                                // store "pass:takeIndex" so we can restore the exact take
+                                const t = (choice === "base") ? null : currentTake(choice);
+                                node.obvpmRefineActive[key] = choice === "base"
+                                    ? "base"
+                                    : (choice + ":" + ((node.obvpmPassTake[key] || {})[choice] ?? (takesOf(choice).length - 1)));
+                                saveRefineActive(node.obvpmRefineActive);
+                                try { paintRefineSeams(lastEntries); } catch {}
+                                node._obvpmRefreshRefineHint?.();
+                                block.dataset.obvpmSource = choice;
+                                // resolve the actual chain entry for preview
+                                const resolved = (choice === "base") ? null : currentTake(choice);
+                                const ent = resolved ? resolved.ent : null;
+                                // M2: switch this clip's preview source
+                                if (choice === "base") {
+                                    // restore original playlist entry
+                                    if (playlist[i] && playlist[i]._baseClip) {
+                                        playlist[i].clip = playlist[i]._baseClip;
+                                        playlist[i].enter = playlist[i]._baseEnter;
+                                        playlist[i].exit = playlist[i]._baseExit;
+                                    }
+                                } else {
+                                    const resolved = currentTake(choice);
+                                    const ent = resolved ? resolved.ent : null;
+                                    if (ent && ent.take && playlist[i]) {
+                                        if (!playlist[i]._baseClip) {
+                                            playlist[i]._baseClip = playlist[i].clip;
+                                            playlist[i]._baseEnter = playlist[i].enter;
+                                            playlist[i]._baseExit = playlist[i].exit;
+                                        }
+                                        // play the take (same folder assumed)
+                                        // Do NOT overwrite enter/exit: chain layout is
+                                        // latent steps, not timeline frames. Keeping the
+                                        // original cut stops the playhead from collapsing.
+                                        const baseDir = e.clip.includes("/")
+                                            ? e.clip.slice(0, e.clip.lastIndexOf("/") + 1)
+                                            : "";
+                                        playlist[i].clip = baseDir + ent.take;
+                                        // the file is already trimmed to the
+                                        // join, so play it from the start;
+                                        // the base enter would skip into it
+                                        playlist[i].enter = 0;
+                                        playlist[i].exit = null;
+                                    }
+                                }
+                                // force a reload of this item on next play
+                                if (vids[act]._item === playlist[i]) {
+                                    vids[act]._item = null;
+                                }
+                                // immediately preview the selected source for this clip
+                                try { playAt(i, 0, false); } catch {}
+                                single = null; // force full preview rebuild with new take
+                                console.log("M2 source for", key, "->", choice,
+                                            playlist[i]?.clip);
+                            });
+                            sel.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+                            pinSlot.appendChild(sel);
+                            pinSlot.appendChild(arrowWrap);
+                            // apply default/restored choice so seeking doesn't fall back to base
+                            sel.dispatchEvent(new Event("change"));
+                        }).catch(() => {});
                     subRow.append(sub, mbadge, pinSlot);
                     const topRow = document.createElement("div");
                     Object.assign(topRow.style, {
@@ -8689,7 +9056,7 @@ app.registerExtension({
                     strip.scrollLeft = keepScroll;   // after layout settles
                     setPlayhead(heldFrame);
                     drawRuler();
-                    drawLinks(entries);
+                    drawLinks(entries); paintRefineSeams(entries);
                     paintSeamTitles();   // drawLinks rebuilt the pills
                 });
                 node.graph?.setDirtyCanvas(true);
@@ -9072,6 +9439,7 @@ app.registerExtension({
             // Selection IS the highlighted clip (the one the playhead /
             // last click sits on) -- no separate selection state.
             function renderClipInfo() {
+                node._obvpmRenderClipInfo = renderClipInfo;
                 infoIdx = lastHighlight;
                 const idx = lastHighlight;
                 const e = lastEntries?.[idx];
@@ -11579,3 +11947,27 @@ function buildResultPreview(node) {
         return onRemoved?.apply(this, arguments);
     };
 }
+
+
+// M2/M3: refresh refine dropdowns after a run finishes (no tab reload)
+function refreshRefineStrips() {
+    try {
+        refineChainCache.clear();
+        const nodes = app.graph?._nodes || [];
+        for (const n of nodes) {
+            if (typeof n._obvpmRenderClipInfo === "function") {
+                n._obvpmRenderClipInfo();
+            }
+        }
+    } catch (err) {
+        console.warn("refine refresh failed", err);
+    }
+}
+// success, cancel, or error — a finished pass may already be on disk
+api.addEventListener("execution_success", refreshRefineStrips);
+api.addEventListener("execution_interrupted", refreshRefineStrips);
+api.addEventListener("execution_error", refreshRefineStrips);
+api.addEventListener("status", (e) => {
+    const q = e.detail?.exec_info?.queue_remaining;
+    if (q === 0) setTimeout(refreshRefineStrips, 400);
+});

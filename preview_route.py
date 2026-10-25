@@ -836,7 +836,7 @@ def build_preview(sequence, crf, probe=False, base_folder="",
 
 
 def _build_preview(sequence, crf, probe=False, base_folder="",
-                   preview_filename=None, level_lock=True,
+                   preview_filename=None, preview_max_edge=0, level_lock=True,
                    level_lock_frames=levellock.FRAMES,
                    level_lock_flicker=True, crossfade=True,
                    crossfade_frames=0, audio_declick=True,
@@ -892,6 +892,7 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
     fixes = [[one[k] for k in sorted(base_opts)] for one in seam_plan]
     key = hashlib.sha256(
         json.dumps([key_src, int(crf), fixes, bool(loop),
+                    int(preview_max_edge or 0),
                     BUILD_VERSION]).encode()).hexdigest()[:16]
     out_path, meta_path, name, sub = _preview_paths(base_folder,
                                                     preview_filename)
@@ -1194,6 +1195,28 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
             frames.append(imgs[e["enter"]:hi])
             prog.step(1.0, "re-encoding %s" % _short(e))
         prog.emit("assembling")
+        # Normalize mixed resolutions (base vs upscale takes) and optionally cap.
+        if frames:
+            import torch.nn.functional as F
+            max_h = max(f.shape[1] for f in frames)
+            max_w = max(f.shape[2] for f in frames)
+            edge = int(preview_max_edge or 0)
+            if edge and max(max_h, max_w) > edge:
+                scale = edge / max(max_h, max_w)
+                max_h = max(2, int(max_h * scale) // 2 * 2)
+                max_w = max(2, int(max_w * scale) // 2 * 2)
+            normed = []
+            for f in frames:
+                if f.shape[1] == max_h and f.shape[2] == max_w:
+                    normed.append(f)
+                    continue
+                # f is N,H,W,C in 0..1
+                t = f.permute(0, 3, 1, 2)
+                t = F.interpolate(t, size=(max_h, max_w), mode="bilinear",
+                                  align_corners=False)
+                normed.append(t.permute(0, 2, 3, 1))
+            frames = normed
+            _LOG.info("obvpm.h3: preview normalized to %dx%d", max_w, max_h)
         H3SaveVideoWithMCtx._encode_mp4(
             out_path, torch.cat(frames, dim=0), audio, crf)
         prog.step(1.0, "assembling")
@@ -1409,6 +1432,7 @@ def register():
                     build_preview, str(data.get("sequence", "")),
                     int(data.get("crf", 19)), bool(data.get("probe", False)),
                     str(data.get("base_folder", "")), target,
+                    preview_max_edge=int(data.get("preview_max_edge") or 0),
                     on_progress=(None if data.get("probe")
                                  else _progress_sink(target)),
                     **_fix_opts(data)))
@@ -1492,6 +1516,20 @@ def register():
             _LOG.exception("obvpm.h3: video_workflow failed: %s: %s",
                            type(exc).__name__, exc)
             return web.json_response({"error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/obvpm/h3/refine_chain")
+    async def _refine_chain(request):
+        """Return the refine chain for a clip (M2). Empty list if none."""
+        import asyncio
+        from . import refine_chain as rc
+        try:
+            data = await request.json()
+            clip = str(data.get("clip", ""))
+            chain = await asyncio.to_thread(rc.load_chain, clip)
+            return web.json_response({"chain": chain})
+        except Exception as exc:
+            _LOG.info("obvpm.h3: refine_chain route failed: %s", exc)
+            return web.json_response({"chain": [], "error": str(exc)})
 
     @PromptServer.instance.routes.post("/obvpm/h3/clip_meta")
     async def _clip_meta(request):

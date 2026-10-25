@@ -16,7 +16,7 @@ from .nodes_budget import H3VramHeadroom
 from .nodes_encode import H3MCtxFromFrames
 from .nodes_live import H3LivePreview
 from .nodes_joint import (H3ContextWindows, H3JointAudioMask,
-                          H3JointConditioning, H3JointLatent)
+                          H3JointConditioning, H3JointLatent, H3LoadRefinedLatent, H3AttachNeighborContext, H3TrimAttachedContext, H3SkipIfAtSize)
 from .nodes_load import H3LoadMCtx, H3LoadVideoWithMCtx
 from .nodes_render import H3JointRender
 from .nodes_result import H3ResultPreview
@@ -50,6 +50,10 @@ NODE_CLASS_MAPPINGS = {
     "H3MCtxApplyPins": H3MCtxApplyPins,
     "H3TrimPinned": H3TrimPinned,
     "H3JointLatent": H3JointLatent,
+    "H3LoadRefinedLatent": H3LoadRefinedLatent,
+    "H3AttachNeighborContext": H3AttachNeighborContext,
+    "H3TrimAttachedContext": H3TrimAttachedContext,
+    "H3SkipIfAtSize": H3SkipIfAtSize,
     "H3JointConditioning": H3JointConditioning,
     "H3JointAudioMask": H3JointAudioMask,
     "H3ContextWindows": H3ContextWindows,
@@ -72,6 +76,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3MCtxApplyPins": "H3 MCtx Apply Pins",
     "H3TrimPinned": "H3 MCtx Trim Pinned",
     "H3JointLatent": "H3 Join Latents",
+    "H3LoadRefinedLatent": "H3 Load Refined Latent",
+    "H3AttachNeighborContext": "H3 Attach Neighbor Context",
+    "H3TrimAttachedContext": "H3 Trim Attached Context",
+    "H3SkipIfAtSize": "H3 Skip If At Size",
     "H3JointConditioning": "H3 Joint Conditioning",
     "H3JointAudioMask": "H3 Joint Audio Mask",
     "H3ContextWindows": "H3 Context Windowing",

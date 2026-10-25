@@ -1,3 +1,4 @@
+import json
 """Joint refine: sample the whole timeline in one pass, in sliding windows.
 
 A per-clip refine re-invents fine texture from its own prior and noise,
@@ -43,6 +44,7 @@ from . import avpack
 from . import condload
 from . import frames as fr
 from . import mctx
+from . import refine_chain
 from . import nodes_assemble as na
 from . import nodes_load
 from . import wiretypes as wt
@@ -920,6 +922,210 @@ def assemble(videos, audios, layout):
     return video, audio
 
 
+
+def _fit_steps(video, audio, n_steps):
+    """Crop or pad a latent so its temporal dim matches n_steps."""
+    import torch
+    t = video.shape[2]
+    if t == n_steps:
+        return video, audio
+    if t > n_steps:
+        return video[:, :, :n_steps], audio[..., :audio.shape[-1] * n_steps // max(t, 1)]
+    # pad by repeating last step
+    pad = n_steps - t
+    vpad = video[:, :, -1:].expand(-1, -1, pad, -1, -1)
+    video = torch.cat([video, vpad], dim=2)
+    # audio: rough proportional pad
+    return video, audio
+
+
+def refined_source(clip, refine_active, prefer_newest=True):
+    """Return (take_path, entry) for the refined source to use, or (None, None).
+    refine_active is the map from pin_state (clip -> "base" | "pass:idx").
+    """
+    chain = refine_chain.load_chain(clip)
+    if not chain:
+        return None, None
+    choice = (refine_active or {}).get(clip)
+    if choice == "base":
+        return None, None
+    if choice and ":" in str(choice):
+        try:
+            pass_s, idx_s = str(choice).split(":")
+            cands = [e for e in chain if int(e.get("pass") or 1) == int(pass_s)]
+            ent = cands[int(idx_s)] if 0 <= int(idx_s) < len(cands) else None
+            if ent and refine_chain.load_chain:  # sidecar check below
+                return ent, ent
+        except (ValueError, IndexError):
+            pass
+    # No explicit choice: use base. Auto-newest only if the caller
+    # opted in AND there is no "base" selection. An upscale run should
+    # start from the low-res latent unless the user picked a take.
+    if not choice or choice == "base":
+        return None, None
+    if prefer_newest:
+        for ent in reversed(chain):
+            if ent.get("mctx"):
+                return ent, ent
+    return None, None
+
+
+
+
+
+def _parent_refined_context(clip, child_video=None):
+    """Return (latent_slice, take_name, steps) from the parent's refined
+    take for an extend/prepend, or None."""
+    try:
+        path = nodes_load.resolve_clip_path(clip)
+        side = mctx.sidecar_path(path)
+        if not os.path.isfile(side):
+            return None
+        _, _, header = mctx.load_sidecar(side)
+    except Exception:
+        return None
+    pins = mctx.parse_pins(header) if hasattr(mctx, "parse_pins") else []
+    parent_id = header.get("parent_id") or ""
+    src_frames = 0
+    for s in pins or []:
+        if s.get("place") == "before" and s.get("source_id"):
+            parent_id = parent_id or s["source_id"]
+            src_frames = int(s.get("source_frames") or 0)
+            break
+    if not parent_id:
+        return None
+    folder = os.path.dirname(path)
+    parent_side = None
+    if hasattr(mctx, "scan_for_parent"):
+        parent_side = mctx.scan_for_parent(folder, parent_id)
+    if not parent_side:
+        return None
+    # sidecar is clip.mctx.safetensors -> clip.mp4
+    if parent_side.endswith(".mctx.safetensors"):
+        parent_clip = parent_side[:-len(".mctx.safetensors")] + ".mp4"
+    else:
+        parent_clip = os.path.splitext(parent_side)[0] + ".mp4"
+    chain = refine_chain.load_chain(parent_clip)
+    if not chain:
+        # also try output-relative
+        try:
+            rel = os.path.relpath(parent_clip, os.path.dirname(path))
+        except Exception:
+            rel = None
+        if rel:
+            chain = refine_chain.load_chain(rel)
+    if not chain:
+        return None
+    # Pass-matched graft: pass1 child uses parent pass1, pass2 uses pass2.
+    # Never resize a different pass to fit. If the matched pass's latent
+    # size differs, skip and say so.
+    target = tuple(child_video.shape[3:]) if child_video is not None else None
+    parent_dir = os.path.dirname(parent_side)
+
+    def _load_take(cand):
+        if not cand or not cand.get("take"):
+            return None
+        tside = mctx.sidecar_path(os.path.join(parent_dir, cand["take"]))
+        if not os.path.isfile(tside):
+            return None
+        try:
+            return mctx.load_sidecar(tside)[0]
+        except Exception:
+            return None
+
+    # Infer target pass from child size vs parent takes:
+    # child already at some parent pass size -> next pass; else pass 1.
+    by_pass = {}
+    for cand in chain:
+        lat = _load_take(cand)
+        if lat is None:
+            continue
+        by_pass.setdefault(int(cand.get("pass") or 1), (cand, lat))
+    want = 1
+    if target is not None:
+        for p, (cand, lat) in sorted(by_pass.items()):
+            if tuple(lat.shape[3:]) == target:
+                want = p + 1
+                break
+    if want not in by_pass:
+        # no parent take for this pass — do not borrow another pass
+        _LOG.info("obvpm.h3 joint: no parent pass %d sidecar for graft "
+                  "(have %s); skipped", want, sorted(by_pass))
+        return None
+    ent, pv = by_pass[want]
+    if target is not None and tuple(pv.shape[3:]) != target:
+        _LOG.info("obvpm.h3 joint: parent pass %d %s is %s, child is %s; "
+                  "not resizing across passes", want, ent.get("take"),
+                  tuple(pv.shape[3:]), target)
+        return None
+    _LOG.info("obvpm.h3 joint: graft pass %d from %s (job %s)",
+              want, ent.get("take"), ent.get("job_id"))
+
+    ctx = src_frames or int(header.get("pinned_head_frames") or 0) or 39
+    steps = min(pv.shape[2], max(1, (ctx // 17) + 1))
+    # extend (before-pin) takes the parent's TAIL; prepend would take the head
+    place = "before"
+    for s in pins or []:
+        if s.get("source_id") == parent_id or s.get("place") == "before":
+            place = s.get("place") or "before"
+            break
+    if place == "before":
+        sl = pv[:, :, -steps:]
+    else:
+        sl = pv[:, :, :steps]
+    return sl, ent.get("take"), steps
+
+
+def _load(clips, refine_map=None, prefer_newest=True):
+    videos, audios = [], []
+    refine_map = refine_map or {}
+    for clip in clips:
+        ent, _ = refined_source(clip, refine_map, prefer_newest)
+        if ent and ent.get("take"):
+            # load the refined take's sidecar instead of the base
+            take_path = os.path.join(os.path.dirname(
+                nodes_load.resolve_clip_path(clip)), ent["take"])
+            side = mctx.sidecar_path(take_path)
+            if os.path.isfile(side):
+                v, a, _ = mctx.load_sidecar(side)
+                _LOG.info("obvpm.h3 joint: %s -> refined %s",
+                          os.path.basename(clip), ent["take"])
+            else:
+                _LOG.warning("obvpm.h3 joint: refined sidecar missing for %s "
+                             "(%s) — skipping substitution",
+                             os.path.basename(clip), ent["take"])
+                v, a, _ = mctx.load_sidecar(mctx.sidecar_path(
+                    nodes_load.resolve_clip_path(clip)))
+        else:
+            v, a, _ = mctx.load_sidecar(mctx.sidecar_path(
+                nodes_load.resolve_clip_path(clip)))
+        # Graft refined parent context onto extend/prepend head
+        try:
+            grafted = _parent_refined_context(clip, v)
+            if grafted is not None:
+                ctx_lat, take_name, steps = grafted
+                n = min(steps, v.shape[2], ctx_lat.shape[2])
+                if n > 0 and ctx_lat.shape[3:] == v.shape[3:]:
+                    v = v.clone()
+                    v[:, :, :n] = ctx_lat[:, :, :n].to(v.dtype)
+                    _LOG.info("obvpm.h3 joint: grafted %d steps from %s onto %s",
+                              n, take_name, os.path.basename(clip))
+                    # marker the chain writer reads
+                    try:
+                        marker = os.path.splitext(nodes_load.resolve_clip_path(clip))[0] + ".grafted_from"
+                        with open(marker, "w", encoding="utf-8") as mf:
+                            mf.write(take_name or "")
+                    except Exception:
+                        pass
+                elif n > 0:
+                    _LOG.info("obvpm.h3 joint: parent context %s size %s != %s; skipped graft",
+                              take_name, tuple(ctx_lat.shape[3:]), tuple(v.shape[3:]))
+        except Exception as exc:
+            _LOG.warning("obvpm.h3 joint: parent context graft failed: %s", exc)
+        videos.append(v)
+        audios.append(a)
+    return videos, audios
+
 class H3JointLatent:
     """The timeline's clips, laid onto one latent at their true positions."""
 
@@ -957,6 +1163,16 @@ class H3JointLatent:
                     "tooltip": "The timeline, one output-relative clip per "
                                "line -- the Timeline's sequence output."}),
             },
+            "optional": {
+                "refine_active": ("STRING", {
+                    "default": "",
+                    "tooltip": "JSON map of clip -> active refine choice "
+                               "(from the Timeline). Empty = auto-newest."}),
+                "prefer_newest": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "When no explicit choice, use the newest "
+                               "refined take that still has a sidecar."}),
+            },
         }
 
     @classmethod
@@ -965,7 +1181,12 @@ class H3JointLatent:
         # under the same name must not be served from an earlier prompt
         return float("nan")
 
-    def build(self, sequence):
+    def build(self, sequence, refine_active="", prefer_newest=True):
+        try:
+            self._refine_map = json.loads(refine_active) if refine_active else {}
+        except Exception:
+            self._refine_map = {}
+        self._prefer_newest = bool(prefer_newest)
         items = sequence_items(sequence)
         lines = [line for kind, line in items if kind == "clip"]
         clips = [clip_of_line(line) for line in lines]
@@ -1000,21 +1221,20 @@ class H3JointLatent:
                       "rendered on its own, then joined", len(segs))
         return (latents, records)
 
-    @staticmethod
-    def _load(clips):
-        videos, audios = [], []
-        for clip in clips:
-            v, a, _ = mctx.load_sidecar(mctx.sidecar_path(
-                nodes_load.resolve_clip_path(clip)))
-            videos.append(v)
-            audios.append(a)
-        return videos, audios
+
 
     def _segment(self, clips, lines, headers, cuts):
         """One segment: laid out, cropped to what the cut shows, assembled."""
-        videos, audios = self._load(clips)
+        videos, audios = _load(clips, getattr(self, "_refine_map", {}), getattr(self, "_prefer_newest", True))
         layout = timeline_layout(lines, headers, [a.shape[-1] for a in audios],
                                  cuts=cuts)
+        # fit any substituted refined latent to the step count the layout expects
+        for i, (v, a) in enumerate(zip(videos, audios)):
+            n = layout["steps"][i][1]
+            if v.shape[2] != n:
+                videos[i], audios[i] = _fit_steps(v, a, n)
+                _LOG.info("obvpm.h3 joint: fitted clip %d latent %d -> %d steps",
+                          i, v.shape[2], n)
         lo, hi = shown_range(layout, headers, cuts)
         if hi <= lo:
             raise ValueError("H3 Join Latents: the cut shows nothing of %s "
@@ -1038,7 +1258,7 @@ class H3JointLatent:
 
     def _loop(self, sequence, clips, lines, headers):
         """A looping cut in one piece: the whole joint, the wrap as the crop."""
-        videos, audios = self._load(clips)
+        videos, audios = _load(clips, getattr(self, "_refine_map", {}), getattr(self, "_prefer_newest", True))
         layout = timeline_layout(lines, headers, [a.shape[-1] for a in audios])
         video, audio = assemble(videos, audios, layout)
         record = dict(layout, clips=list(clips), lines=list(lines), loop=True)
@@ -1459,14 +1679,44 @@ def layout_windows(total, length, overlap, table):
     """The run's windows with their conditioning owner: anchored per clip
     when the table carries the cut's ownership, else one grid over the
     timeline with each window owned by the clip holding most of it (or
-    None without a table)."""
+    None without a table).
+
+    A neighbor splice shifts the body. Windows are built on the body and
+    offset by the prepend, so a prepend, an append, both, or neither all
+    keep the body on the 5-step cycle. Context steps stay in the latent
+    but are not a window start."""
+    pre = app = 0
+    try:
+        pre = int(_LAST_SPLICE.get("prepend_steps") or 0)
+        app = int(_LAST_SPLICE.get("append_steps") or 0)
+    except Exception:
+        pass
+    body = max(1, total - pre - app)
     owners = (table or {}).get("owners")
-    if table and owners and len(owners) == total and table.get("spans"):
-        return anchored_windows(total, length, overlap, table["spans"], owners)
-    grid = static_windows(total, length, overlap)
-    if not table:
-        return [(s, e, None) for s, e in grid]
-    return [(s, e, window_owner(table["spans"], s, e)) for s, e in grid]
+    # owners describe the body; compare against body length, not total
+    if table and owners and len(owners) == body and table.get("spans"):
+        windows = anchored_windows(body, length, overlap, table["spans"], owners)
+    else:
+        grid = static_windows(body, length, overlap)
+        if not table:
+            windows = [(s, e, None) for s, e in grid]
+        else:
+            windows = [(s, e, window_owner(table["spans"], s, e)) for s, e in grid]
+    if pre or app:
+        # First window covers the held head. Later windows keep their
+        # offset, so the overlap sits in the body and the pyramid blend
+        # smooths the boundary. Anchoring every window on the head made
+        # the overlap total and the blend did nothing.
+        shifted = []
+        for i, (s, e, j) in enumerate(windows):
+            s2, e2 = s + pre, min(e + pre, total)
+            if i == 0 and pre:
+                s2 = 0
+            shifted.append((s2, e2, j))
+        windows = shifted
+        _LOG.info("obvpm.h3 context windows: splice prepend=%d append=%d "
+                  "(context in first window, overlap in the body)", pre, app)
+    return windows
 
 
 def pyramid(n):
@@ -1653,7 +1903,20 @@ class H3WindowHandler:
         if shapes is None:
             return False
         total = int(shapes[0][2])
-        use = total > self.context_length
+        # A splice makes the latent longer than the clip. With the
+        # boundary already blended into the body, keep it one window so
+        # no second window samples the body without the held context.
+        pre = app = 0
+        try:
+            pre = int(_LAST_SPLICE.get("prepend_steps") or 0)
+            app = int(_LAST_SPLICE.get("append_steps") or 0)
+        except Exception:
+            pass
+        limit = self.context_length + pre + app + (8 if (pre or app) else 0)
+        use = total > limit
+        if (pre or app) and not use:
+            _LOG.info("obvpm.h3 context windows: splice kept to one window "
+                      "(%d steps, limit %d)", total, limit)
         table = self._table(conds)
         if id(table) != self._table_id:
             self._table_id = id(table)
@@ -2174,3 +2437,570 @@ def _window_activation_mb(noise_shape):
         area *= int(n)
     tokens = int(noise_shape[0]) * int(noise_shape[1]) * area / float(ch * _PATCH_AREA)
     return tokens * _ACTIVATION_MB_PER_TOKEN
+
+
+class H3LoadRefinedLatent:
+    """Load existing pass-N sidecars and assemble them like a joint.
+    Outputs a boolean that is true when every clip had that pass,
+    so a mute + If/Else can skip pass 1 automatically."""
+
+    CATEGORY = "obvpm/h3"
+    FUNCTION = "load"
+    RETURN_TYPES = ("LATENT", "BOOLEAN", wt.JOINT)
+    RETURN_NAMES = ("latent", "skip_pass", "layout")
+    DESCRIPTION = (
+        "Loads each clip's refine-chain sidecar for the given pass and "
+        "assembles them into one latent. skip_pass is true only when "
+        "every clip had that pass on disk — wire it to mute pass 1 and "
+        "to an If/Else (true = this latent, false = pass 1 output)."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sequence": ("STRING", {"default": "", "multiline": True}),
+                "pass_num": ("INT", {"default": 1, "min": 1, "max": 8}),
+            },
+        }
+
+    def load(self, sequence, pass_num):
+        items = sequence_items(sequence)
+        lines = [line for kind, line in items if kind == "clip"]
+        clips = [clip_of_line(line) for line in lines]
+        if not clips:
+            raise ValueError("H3 Load Refined Latent: sequence is empty.")
+        videos, audios, missing = [], [], []
+        for clip in clips:
+            chain = refine_chain.load_chain(clip)
+            ent = next((e for e in reversed(chain)
+                        if int(e.get("pass") or 1) == int(pass_num) and e.get("take")), None)
+            if not ent:
+                missing.append(clip)
+                continue
+            take = os.path.join(os.path.dirname(nodes_load.resolve_clip_path(clip)), ent["take"])
+            side = mctx.sidecar_path(take)
+            if not os.path.isfile(side):
+                missing.append(clip)
+                continue
+            v, a, _ = mctx.load_sidecar(side)
+            videos.append(v)
+            audios.append(a)
+        skip = len(missing) == 0 and len(videos) == len(clips)
+        if not skip:
+            _LOG.info("obvpm.h3 load refined: pass %d missing for %s",
+                      pass_num, ", ".join(os.path.basename(c) for c in missing) or "(none)")
+            # still return a tiny placeholder latent so the switch has a type
+            import torch
+            z = torch.zeros(1, 16, 1, 8, 8)
+            return ({"samples": z}, False, {})
+        # Layout from the refined sidecars themselves, not the base headers.
+        # A pass-1 take is longer in steps than the base clip it came from.
+        steps, ticks, acc_s, acc_t = [], [], 0, 0
+        for v, a in zip(videos, audios):
+            ns, nt = int(v.shape[2]), int(a.shape[-1])
+            steps.append((acc_s, ns))
+            ticks.append((acc_t, nt))
+            acc_s += ns
+            acc_t += nt
+        layout = {
+            "steps": steps,
+            "ticks": ticks,
+            "total_steps": acc_s,
+            "total_ticks": acc_t,
+            "total_frames": acc_s,
+            "owner_steps": [i for i, (s, n) in enumerate(steps) for _ in range(n)],
+            "owner_ticks": [i for i, (s, n) in enumerate(ticks) for _ in range(n)],
+            "clips": list(clips),
+            "lines": list(lines),
+        }
+        video, audio = assemble(videos, audios, layout)
+        _LOG.info("obvpm.h3 load refined: pass %d for %d clip(s) — skip pass 1",
+                  pass_num, len(clips))
+        return (avpack.pack_av(video, audio, name="refined"), True, layout)
+
+
+
+
+_LAST_SPLICE = {"prepend_steps": 0, "append_steps": 0}
+
+
+def _source_clip_for_take(path):
+    """If `path` is an upscale take, the base clip whose chain lists it."""
+    folder = os.path.dirname(path)
+    name = os.path.basename(path)
+    try:
+        chains = [f for f in os.listdir(folder) if f.endswith(".refine_chain.json")]
+    except OSError:
+        return None
+    for chain_name in chains:
+        try:
+            entries = refine_chain.load_chain(os.path.join(folder, chain_name[:-len(".refine_chain.json")] + ".mp4"))
+        except Exception:
+            continue
+        if any(e.get("take") == name for e in entries):
+            return os.path.join(folder, chain_name[:-len(".refine_chain.json")] + ".mp4")
+    return None
+
+
+def _pin_parent_clip(clip):
+    """Video path of the clip this one extends/prepends, or None."""
+    try:
+        path = nodes_load.resolve_clip_path(clip)
+    except Exception as exc:
+        _LOG.info("obvpm.h3 attach: pin lookup failed for %s: %s", clip, exc)
+        return None
+    side = mctx.sidecar_path(path)
+    if not os.path.isfile(side):
+        source = _source_clip_for_take(path)
+        if source:
+            _LOG.info("obvpm.h3 attach: %s is a take; pin from %s",
+                      os.path.basename(path), os.path.basename(source))
+            return _pin_parent_clip(source)
+        _LOG.info("obvpm.h3 attach: no sidecar for %s", path)
+        return None
+    try:
+        _, _, header = mctx.load_sidecar(side)
+    except Exception as exc:
+        _LOG.info("obvpm.h3 attach: sidecar unreadable %s: %s", side, exc)
+        return None
+    pins = mctx.parse_pins(header) if hasattr(mctx, "parse_pins") else []
+    parent_id = header.get("parent_id") or ""
+    for s in pins or []:
+        if s.get("place") == "before" and s.get("source_id"):
+            parent_id = parent_id or s["source_id"]
+            break
+    if not parent_id:
+        _LOG.info("obvpm.h3 attach: %s has no pin parent", os.path.basename(path))
+        return None
+    parent_side = mctx.scan_for_parent(os.path.dirname(path), parent_id)
+    if not parent_side:
+        _LOG.info("obvpm.h3 attach: parent id %s not in %s", parent_id, os.path.dirname(path))
+        return None
+    if parent_side.endswith(".mctx.safetensors"):
+        return parent_side[:-len(".mctx.safetensors")] + ".mp4"
+    return os.path.splitext(parent_side)[0] + ".mp4"
+
+
+class H3AttachNeighborContext:
+    """After the latent upscaler: splice matching-pass neighbor sidecars
+    onto the upscaled latent. No resize — sizes must already match."""
+
+    CATEGORY = "obvpm/h3"
+    FUNCTION = "attach"
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    DESCRIPTION = (
+        "Place after the latent upscaler. For each clip being refined, "
+        "loads the left neighbor's pass-N tail and the right neighbor's "
+        "pass-N head from their refine-chain sidecars and concatenates "
+        "them. Neighbor latents are not resized; a size mismatch is skipped."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "sequence": ("STRING", {"default": "", "multiline": True}),
+                "pass_num": ("INT", {"default": 1, "min": 1, "max": 8}),
+            },
+            "optional": {
+                "context_frames": ("INT", {"default": 39, "min": 5, "max": 180}),
+                "context_denoise": ("FLOAT", {
+                    "default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Denoise at the splice boundary. 0 is a hard "
+                               "hold. A small value lets the body agree with "
+                               "the neighbor.",
+                }),
+            },
+        }
+
+    def attach(self, latent, sequence, pass_num, context_frames=39, context_denoise=0.3):
+        """Splice neighbor pass-N context onto an already-concatenated AV latent.
+        Place AFTER Concat AV Latent so video is at pass size and audio matches."""
+        video, audio = avpack.unpack_av(latent, name="attach")
+        items = sequence_items(sequence)
+        lines = [line for kind, line in items if kind == "clip"]
+        clips = [clip_of_line(line) for line in lines]
+        steps = max(1, int(context_frames) // 17 + 1)
+        # the clip being refined, before any parent is inserted
+        target_clip = clips[0] if len(clips) == 1 else None
+        # Upscale sequence is a subset (only the target). Recover the
+        # parent from the pin so a one-clip refine still gets context.
+        if len(clips) < 2 and clips:
+            parent = _pin_parent_clip(clips[0])
+            if parent:
+                # extend: parent is on the left. prepend: the clip was
+                # inserted before its parent, so the parent is on the right.
+                prepend = False
+                try:
+                    _, _, hdr = mctx.load_sidecar(
+                        mctx.sidecar_path(nodes_load.resolve_clip_path(clips[0])))
+                    rel = str(hdr.get("relation") or "")
+                    pins = mctx.parse_pins(hdr) if hasattr(mctx, "parse_pins") else []
+                    prepend = rel == "prepends" or any(
+                        s.get("place") == "after" for s in pins or [])
+                except Exception:
+                    pass
+                _LOG.info("obvpm.h3 attach: subset has %s; parent %s from pin (%s)",
+                          os.path.basename(clips[0]), os.path.basename(parent),
+                          "prepend" if prepend else "extend")
+                clips = [clips[0], parent] if prepend else [parent, clips[0]]
+            else:
+                _LOG.info("obvpm.h3 attach: one clip and no pin parent, nothing to splice")
+                return (latent,)
+        elif len(clips) < 2:
+            _LOG.info("obvpm.h3 attach: fewer than 2 clips, nothing to splice")
+            return (latent,)
+
+        def take_av(clip, pas):
+            chain = refine_chain.load_chain(clip)
+            if not chain:
+                _LOG.info("obvpm.h3 attach: no chain for %s", os.path.basename(clip))
+                return None, None, None
+            ent = next((e for e in reversed(chain)
+                        if int(e.get("pass") or 1) == int(pas) and e.get("take")), None)
+            if not ent:
+                _LOG.info("obvpm.h3 attach: %s has no pass %d (passes %s)",
+                          os.path.basename(clip), pas,
+                          sorted({e.get("pass") for e in chain}))
+                return None, None, None
+            path = nodes_load.resolve_clip_path(clip)
+            folder = os.path.dirname(path)
+            # prefer the recorded mctx name; fall back to take's sidecar
+            side = os.path.join(folder, ent["mctx"]) if ent.get("mctx") else ""
+            if not side or not os.path.isfile(side):
+                side = mctx.sidecar_path(os.path.join(folder, ent["take"]))
+            if not os.path.isfile(side):
+                _LOG.info("obvpm.h3 attach: sidecar missing %s", side)
+                return None, None, None
+            v, a, _ = mctx.load_sidecar(side)
+            return v, a, ent.get("take")
+
+        # The upscaled latent is the clip being refined. In a pin-fallback
+        # subset that clip is last (parent was inserted in front) and has
+        # no chain yet, so do not pick the neighbor by length.
+        # stale splice lengths from a previous run (a prepend leaves a
+        # tail count) must not leak into an extend
+        _LAST_SPLICE["append_steps"] = 0
+        _LAST_SPLICE["prepend_steps"] = 0
+        _LAST_SPLICE.pop("shown_frames", None)
+        _LAST_SPLICE.pop("cut_step", None)
+        loaded = [take_av(c, pass_num) for c in clips]
+        # the clip from the upscale sequence, not whichever lacks a chain:
+        # a re-run has a chain already, and guessing would splice the
+        # clip's own take onto its parent
+        if target_clip:
+            target_i = next((i for i, c in enumerate(clips) if c == target_clip),
+                            len(clips) - 1)
+        else:
+            target_i = len(clips) - 1
+        vparts, aparts, names = [video], [audio], ["upscaled"]
+        def _seamless(a_clip, b_clip):
+            """True when b extends a (lineage / green seam). A hard cut is not."""
+            try:
+                ah = mctx.load_sidecar(mctx.sidecar_path(nodes_load.resolve_clip_path(a_clip)))[2]
+                bh = mctx.load_sidecar(mctx.sidecar_path(nodes_load.resolve_clip_path(b_clip)))[2]
+            except Exception:
+                return False
+            return _linked(ah, bh)
+        if target_i > 0:
+            # a pin is the authority: the timeline linked them even when
+            # the sidecar lineage reads as a hard cut
+            pinned = bool(_pin_parent_clip(clips[target_i]))
+            if not pinned and not _seamless(clips[target_i - 1], clips[target_i]):
+                _LOG.info("obvpm.h3 attach: left join is a hard cut; not splicing")
+                loaded[target_i - 1] = (None, None, None)
+            v, a, name = loaded[target_i - 1]
+            if v is not None and tuple(v.shape[3:]) == tuple(video.shape[3:]):
+                n = min(steps, v.shape[2])
+                # body must stay on the 5-step cycle or windows strobe
+                while n % 5:
+                    n = min(v.shape[2], n + 1)
+                vparts.insert(0, v[:, :, -n:])
+                if a is not None:
+                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
+                    aparts.insert(0, a[..., -an:])
+                names.insert(0, name)
+            elif v is not None:
+                _LOG.info("obvpm.h3 attach: left %s is %s, upscaled is %s; skipped",
+                          name, tuple(v.shape[3:]), tuple(video.shape[3:]))
+        if target_i + 1 < len(clips):
+            pinned = bool(_pin_parent_clip(clips[target_i]))
+            if not pinned and not _seamless(clips[target_i], clips[target_i + 1]):
+                _LOG.info("obvpm.h3 attach: right join is a hard cut; not splicing")
+                loaded[target_i + 1] = (None, None, None)
+            v, a, name = loaded[target_i + 1]
+            if v is not None and tuple(v.shape[3:]) == tuple(video.shape[3:]):
+                # a prepend lands between steps; more context lets the
+                # blend cover the frame or two the step grid can't hit
+                n = min(max(steps, 10), v.shape[2])
+                while n % 5:
+                    n = min(v.shape[2], n + 1)
+                # a prepend: the parent is played from its enter offset,
+                # not from frame 0. Splice from there or the boundary
+                # shows the parent's head while playback shows its middle.
+                start = 0
+                try:
+                    from . import nodes_assemble as na
+                    _, _, th = mctx.load_sidecar(mctx.sidecar_path(
+                        nodes_load.resolve_clip_path(clips[target_i])))
+                    _, _, nh = mctx.load_sidecar(mctx.sidecar_path(
+                        nodes_load.resolve_clip_path(clips[target_i + 1])))
+                    pr = na._prepend_child(th)
+                    if pr and pr[0] == nh.get("self_id"):
+                        enter = pr[1] - int(nh.get("pinned_head_frames", 0) or 0)
+                        if enter > 0:
+                            # frames_to_latents snaps to the grid and is
+                            # wrong for an offset: frame 13 is step 4,
+                            # not step 2. Find the step that starts at
+                            # or just before the enter frame.
+                            start = 0
+                            while fr.frame_at_latent(start + 1) <= enter:
+                                start += 1
+                            start = min(start, max(0, v.shape[2] - n))
+                            _LOG.info("obvpm.h3 attach: prepend parent "
+                                      "enters at frame %d (step %d starts "
+                                      "at frame %d), splicing from step %d",
+                                      enter, start,
+                                      fr.frame_at_latent(start), start)
+                except Exception as exc:
+                    _LOG.info("obvpm.h3 attach: prepend offset skipped: %s", exc)
+                # compute the cut first, so this pass uses it (it used to
+                # be set after the pop, so only the next pass saw it)
+                at = None
+                try:
+                    _, _, bh = mctx.load_sidecar(mctx.sidecar_path(
+                        nodes_load.resolve_clip_path(clips[target_i])))
+                    shown = int(bh.get("delivered_frames", 0) or 0)
+                    if shown:
+                        cut = 0
+                        while fr.frame_at_latent(cut + 1) <= shown:
+                            cut += 1
+                        _LAST_SPLICE["cut_step"] = cut
+                        _LAST_SPLICE["shown_frames"] = shown
+                        at = cut
+                        _LOG.info("obvpm.h3 attach: prepend cut at step %d "
+                                  "(frame %d shown)", cut, shown)
+                except Exception:
+                    pass
+                # the neighbour's frames at the head too, so the body is
+                # generated continuing from them, the way an extend works.
+                # The head is trimmed off; only the body is kept.
+                vparts.insert(0, v[:, :, start:start + n])
+                names.insert(0, name)
+                if a is not None:
+                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
+                    aparts.insert(0, a[..., :an])
+                _LAST_SPLICE["prepend_steps"] = n
+                # and at the tail, to anchor the end
+                vparts.append(v[:, :, start:start + n])
+                if a is not None:
+                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
+                    aparts.append(a[..., :an])
+                names.append(name)
+            elif v is not None:
+                _LOG.info("obvpm.h3 attach: right %s is %s, upscaled is %s; skipped",
+                          name, tuple(v.shape[3:]), tuple(video.shape[3:]))
+        if len(vparts) == 1:
+            _LAST_SPLICE["prepend_steps"] = 0
+            _LAST_SPLICE["append_steps"] = 0
+            _LOG.info("obvpm.h3 attach: no matching-pass neighbor at %s",
+                      tuple(video.shape[3:]))
+            return (latent,)
+        import torch
+        def _fade(a, b, n, dim):
+            """Crossfade the last n of a into the first n of b along dim."""
+            n = min(n, a.shape[dim], b.shape[dim])
+            if n < 1:
+                return a, b
+            w = torch.linspace(1.0, 0.0, n, device=a.device, dtype=a.dtype)
+            shape = [1] * a.dim()
+            shape[dim] = n
+            w = w.view(*shape)
+            sl_a = [slice(None)] * a.dim()
+            sl_a[dim] = slice(-n, None)
+            sl_b = [slice(None)] * b.dim()
+            sl_b[dim] = slice(0, n)
+            mixed = a[tuple(sl_a)] * w + b[tuple(sl_b)] * (1.0 - w)
+            a = a.clone()
+            b = b.clone()
+            a[tuple(sl_a)] = mixed
+            b[tuple(sl_b)] = mixed
+            return a, b
+        def _pull(body, ref, n, at_start):
+            """Pull one edge of body toward ref. ref is left intact.
+
+            at_start: body's first n steps ramp from ref's last n.
+            else: body's last n steps ramp from ref's first n.
+            The step touching ref is fully ref, fading to fully body."""
+            dim = 2
+            n = min(n, body.shape[dim], ref.shape[dim])
+            if n < 1:
+                return body
+            w = torch.linspace(1.0, 0.0, n, device=body.device, dtype=body.dtype)
+            ref_sl = ref[:, :, -n:] if at_start else ref[:, :, :n]
+            ref_sl = ref_sl.to(body.device, body.dtype)
+            body = body.clone()
+            if at_start:
+                body[:, :, :n] = ref_sl * w.view(1, 1, n, 1, 1) + body[:, :, :n] * (1 - w).view(1, 1, n, 1, 1)
+            else:
+                body[:, :, -n:] = ref_sl.flip(2) * w.view(1, 1, n, 1, 1) + body[:, :, -n:] * (1 - w).view(1, 1, n, 1, 1)
+            return body
+        # Carry the neighbor's microdetail into the body, one way, on the
+        # full latent, before the sampler cuts it into windows.
+        pull = min(4, steps)
+        if names[0] != "upscaled":
+            vparts[1] = _pull(vparts[1], vparts[0], pull, True)
+        if names[-1] != "upscaled" and len(vparts) == 3:
+            vparts[1] = _pull(vparts[1], vparts[2], pull, False)
+        elif names[-1] != "upscaled" and len(vparts) == 2:
+            cut = _LAST_SPLICE.pop("cut_step", None)
+            if cut and 0 < cut < vparts[0].shape[2]:
+                edge = vparts[0][:, :, :cut]
+                edge = _pull(edge, vparts[1], pull, False)
+                vparts[0] = vparts[0].clone()
+                vparts[0][:, :, :cut] = edge
+                # hold the blend zone so the sampler doesn't overwrite
+                # the pulled detail; it's inside the frames we keep
+                _LAST_SPLICE["hold_at"] = max(0, cut - pull)
+                _LAST_SPLICE["hold_len"] = pull
+                _LOG.info("obvpm.h3 attach: detail pull at cut step %d, "
+                          "holding steps %d..%d", cut, cut - pull, cut)
+            else:
+                vparts[0] = _pull(vparts[0], vparts[1], pull, False)
+        pre = int(vparts[0].shape[2]) if names[0] != "upscaled" else 0
+        # a prepend may have preset the trim to cover context plus the
+        # body's tail past the cut; keep that
+        app = _LAST_SPLICE.get("append_steps") or (
+            int(vparts[-1].shape[2]) if names[-1] != "upscaled" else 0)
+        _LAST_SPLICE["prepend_steps"] = pre
+        _LAST_SPLICE["append_steps"] = app
+        _LAST_SPLICE["prepend_latent"] = vparts[0] if pre else None
+        _LAST_SPLICE["append_latent"] = vparts[-1] if app else None
+        out_v = torch.cat(vparts, dim=2)
+        out_a = torch.cat(aparts, dim=-1)
+        packed = avpack.pack_av(out_v, out_a, name="attach")
+        # Hard hold on the context, soft only at the boundary. The
+        # neighbor's frames stay frozen so their details survive. The
+        # last couple of spliced steps ramp up to context_denoise so the
+        # body has something to meet instead of a wall.
+        import comfy.nested_tensor
+        blend = 2  # mask ramp width; the detail pull handles the blend
+        edge = min(1.0, max(0.0, float(context_denoise)))
+        vm = torch.ones((1, 1) + tuple(out_v.shape[2:]), device=out_v.device, dtype=torch.float32)
+        am = torch.ones((1, 1) + tuple(out_a.shape[2:]), device=out_a.device, dtype=torch.float32)
+        if pre:
+            vm[:, :, :pre] = 0
+            n = min(blend, pre)
+            if n and edge:
+                vm[:, :, pre - n:pre] = torch.linspace(
+                    0, edge, n, device=out_v.device).view(1, 1, n, 1, 1)
+            at = int(round(pre / out_v.shape[2] * out_a.shape[-1]))
+            if at:
+                am[..., :at] = 0
+                na = min(at, max(1, n * 4))
+                if edge:
+                    am[..., at - na:at] = torch.linspace(0, edge, na, device=out_a.device)
+        hold_at = _LAST_SPLICE.pop("hold_at", None)
+        hold_len = _LAST_SPLICE.pop("hold_len", 0)
+        if hold_at is not None and hold_len:
+            vm[:, :, hold_at:hold_at + hold_len] = 0
+        if app:
+            vm[:, :, -app:] = 0
+            n = min(blend, app)
+            if n and edge:
+                vm[:, :, -app:-app + n] = torch.linspace(
+                    edge, 0, n, device=out_v.device).view(1, 1, n, 1, 1)
+            at = int(round(app / out_v.shape[2] * out_a.shape[-1]))
+            if at:
+                am[..., -at:] = 0
+                na = min(at, max(1, n * 4))
+                if edge:
+                    am[..., -at:-at + na] = torch.linspace(edge, 0, na, device=out_a.device)
+        packed["noise_mask"] = comfy.nested_tensor.NestedTensor((vm, am))
+        _LOG.info("obvpm.h3 attach: pass %d spliced %s -> %d steps "
+                  "(trim %d head / %d tail, detail pull %d step(s) into body)",
+                  pass_num, " + ".join(names), out_v.shape[2], pre, app, pull)
+        return (packed,)
+
+
+
+class H3TrimAttachedContext:
+    """Crop the spliced context off a refined latent so the next pass
+    receives the body only. Uses the lengths recorded by Attach."""
+
+    CATEGORY = "obvpm/h3"
+    FUNCTION = "trim"
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    DESCRIPTION = (
+        "Place after the sampler, before Set for the next pass. Removes "
+        "the head/tail context H3 Attach Neighbor Context spliced on, "
+        "so pass 2 upscales the body only."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"latent": ("LATENT",)}}
+
+    def trim(self, latent):
+        pre = int(_LAST_SPLICE.get("prepend_steps") or 0)
+        app = int(_LAST_SPLICE.get("append_steps") or 0)
+        if not pre and not app:
+            _LOG.info("obvpm.h3 trim: no splice recorded, latent unchanged")
+            return (latent,)
+        video, audio = avpack.unpack_av(latent, name="trim")
+        t = int(video.shape[2])
+        lo, hi = pre, max(pre + 1, t - app)
+        video = video[:, :, lo:hi]
+        if audio is not None:
+            ticks = int(audio.shape[-1])
+            a0 = int(round(lo / t * ticks))
+            a1 = int(round(hi / t * ticks))
+            audio = audio[..., a0:a1]
+        _LOG.info("obvpm.h3 trim: kept steps %d..%d of %d for next pass", lo, hi, t)
+        _LAST_SPLICE["prepend_steps"] = 0
+        _LAST_SPLICE["append_steps"] = 0
+        return (avpack.pack_av(video, audio, name="trim"),)
+
+
+
+
+class H3SkipIfAtSize:
+    """Pass the latent through when it is already at the upscale target.
+    Wire `skip` to an If/Else: true = this latent, false = upscaler output.
+    Stops the upscaler's scale < 1 refusal for base-at-0.98 / already-p1."""
+
+    CATEGORY = "obvpm/h3"
+    FUNCTION = "gate"
+    RETURN_TYPES = ("LATENT", "BOOLEAN")
+    RETURN_NAMES = ("latent", "skip")
+    DESCRIPTION = (
+        "Compares the latent's pixel area to `megapixels`. If it is already "
+        "at or above the target, skip is true and the latent should bypass "
+        "the upscaler. Otherwise skip is false and the upscaler should run."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "megapixels": ("FLOAT", {"default": 0.98, "min": 0.1, "max": 16.0, "step": 0.01}),
+            },
+        }
+
+    def gate(self, latent, megapixels):
+        video, _ = avpack.unpack_av(latent, name="skip-if-at-size")
+        h, w = int(video.shape[3]), int(video.shape[4])
+        # latent grid is 1/16 of pixels
+        have = (h * 16) * (w * 16) / 1e6
+        target = float(megapixels)
+        skip = have >= target * 0.98  # small tolerance for preset rounding
+        _LOG.info("obvpm.h3 skip-if-at-size: latent %dx%d = %.2f MP, "
+                  "target %.2f MP -> %s",
+                  w * 16, h * 16, have, target,
+                  "skip upscaler" if skip else "upscale")
+        return (latent, skip)

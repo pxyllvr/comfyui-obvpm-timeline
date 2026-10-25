@@ -50,6 +50,8 @@ import folder_paths
 from . import avpack
 from . import frames as fr
 from . import mctx
+from . import refine_chain
+from . import nodes_load
 from . import nodes_save
 from . import wiretypes as wt
 
@@ -159,6 +161,30 @@ def decode_audio(audio_vae, audio):
     from comfy_extras.nodes_audio import vae_decode_audio
     return vae_decode_audio(audio_vae, {"samples": audio})
 
+
+
+
+def _job_id(prompt):
+    """Stable id for every save in the same Comfy prompt/run."""
+    import hashlib, json
+    if prompt is None:
+        return None
+    try:
+        raw = json.dumps(sorted(prompt.keys()), sort_keys=True).encode()
+        raw += str(id(prompt)).encode()
+    except Exception:
+        raw = str(id(prompt)).encode()
+    return hashlib.sha256(raw).hexdigest()[:12]
+
+def _grafted_from(clip):
+    try:
+        p = os.path.splitext(nodes_load.resolve_clip_path(clip))[0] + ".grafted_from"
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read().strip() or None
+    except Exception:
+        pass
+    return None
 
 class H3JointRender:
     """The sampled timeline latent, decoded in windows into one MP4."""
@@ -337,6 +363,117 @@ class H3JointRender:
             except RuntimeError as exc:
                 raise RuntimeError("H3 Joint VAE Decode and Save: %s. The upscale "
                                    "itself was saved: %s" % (exc, cut_path)) from None
+        # M1: record the refine chain for the source clips
+        try:
+            refine_chain.check_green_compatibility(layouts)
+            # determine the take path to record (cut or segment)
+            take_to_record = cut_path
+            if not single:
+                # for multi-segment, record the cut_path as the group take;
+                # individual segment takes are also valid but the cut is the
+                # joined result the user sees
+                take_to_record = cut_path
+            seed = refine_chain.seed_from_sidecar(take_to_record)
+            denoise = None
+            megapixels = None
+            bn = os.path.basename(take_to_record).lower()
+            pass_num = 2 if "pass2" in bn or "pass_2" in bn else 1
+            # Prefer the options/seed node that matches THIS pass
+            def matches_pass(title):
+                t = title.lower()
+                if pass_num == 2:
+                    return "2" in t or "pass 2" in t or "pass2" in t
+                # pass 1: avoid anything that looks like pass 2
+                return not ("2" in t or "pass 2" in t or "pass2" in t)
+            if isinstance(prompt, dict):
+                # first pass: collect candidates that match the pass
+                for nid, node in prompt.items():
+                    if not isinstance(node, dict):
+                        continue
+                    title = str(node.get("_meta", {}).get("title", "") or node.get("class_type", "")).lower()
+                    if not matches_pass(title):
+                        continue
+                    inputs = node.get("inputs") or {}
+                    wv = node.get("widgets_values") or []
+                    is_upscale = any(k in title for k in ("upscale", "refine", "pass", "options"))
+                    if is_upscale or "options" in title:
+                        for key in ("upscale_to_megapixels", "refine_amount", "megapixels"):
+                            if key in inputs:
+                                try:
+                                    val = float(inputs[key])
+                                    if key in ("upscale_to_megapixels", "megapixels"):
+                                        megapixels = val
+                                    elif key == "refine_amount":
+                                        denoise = val
+                                except (TypeError, ValueError):
+                                    pass
+                    if is_upscale and "seed" in title:
+                        for val in list(inputs.values()) + (wv if isinstance(wv, list) else []):
+                            if isinstance(val, int) and 0 <= val < 2**31:
+                                seed = val
+                                break
+            _LOG.info("obvpm.h3 chain: take=%s seed=%s denoise=%s mp=%s pass=%s job=%s",
+                      bn, seed, denoise, megapixels, pass_num, _job_id(prompt))
+            for lay in layouts or []:
+                clips = lay.get("clips") or []
+                steps = lay.get("steps") or []
+                for i, clip in enumerate(clips):
+                    if i >= len(steps):
+                        break
+                    start, length = steps[i]
+                    stem = os.path.splitext(os.path.basename(take_to_record))[0]
+                    # matching sidecars (same stem, same folder)
+                    folder = os.path.dirname(take_to_record)
+                    mctx = os.path.join(folder, stem + ".mctx.safetensors")
+                    cond = os.path.join(folder, stem + ".cond.safetensors")
+                    # context frames from any active pin that uses this clip
+                    ctx_frames = 0
+                    try:
+                        pins = extra_pnginfo.get("pins") if isinstance(extra_pnginfo, dict) else None
+                        # fallback: look in the prompt for pin specs that reference this clip
+                        if not pins and isinstance(prompt, dict):
+                            for node in prompt.values():
+                                if isinstance(node, dict) and "pin_specs" in (node.get("inputs") or {}):
+                                    pins = node["inputs"]["pin_specs"]
+                                    break
+                        if isinstance(pins, list):
+                            for spec in pins:
+                                if not isinstance(spec, dict):
+                                    continue
+                                # rough match on clip name
+                                src = str(spec.get("source") or spec.get("source_id") or "")
+                                if clip and (clip in src or os.path.basename(clip) in src):
+                                    ctx_frames = int(spec.get("source_frames") or 0)
+                                    break
+                    except Exception:
+                        ctx_frames = 0
+                    try:
+                        import frames as _fr
+                    except ImportError:
+                        from . import frames as _fr
+                    f0 = _fr.frame_at_latent(int(start)) if hasattr(_fr, "frame_at_latent") else int(start)
+                    f1 = _fr.frame_at_latent(int(start + length)) if hasattr(_fr, "frame_at_latent") else int(start + length)
+                    entry = {
+                        "take": os.path.basename(take_to_record),
+                        "frame_layout": [int(f0), int(f1)],
+                        "mctx": os.path.basename(mctx) if os.path.isfile(mctx) else None,
+                        "cond": os.path.basename(cond) if os.path.isfile(cond) else None,
+                        "layout": [int(start), int(start + length)],
+                        "context_frames": ctx_frames,
+                        "seed": seed,
+                        "denoise": denoise,
+                        "preset": "h3_upscale_options",
+                        "megapixels": megapixels,
+                        "group": stem,
+                        "pass": pass_num,
+                        "grafted_from": _grafted_from(clip),
+                        "job_id": _job_id(prompt),
+                    }
+                    refine_chain.append_entry(clip, entry)
+                    _LOG.info("obvpm.h3: recorded refine chain entry for %s -> %s",
+                              os.path.basename(clip), entry["take"])
+        except Exception as exc:
+            _LOG.warning("obvpm.h3: refine chain write skipped: %s", exc)
         return (cut_path,)
 
     def _open_sink(self, ctx):
@@ -368,11 +505,20 @@ class H3JointRender:
                       "the sampled one")
         total_steps = int(video.shape[2])
         frames = fr.pixel_frames(total_steps)
-        if layout and int(layout.get("total_steps", total_steps)) != total_steps:
+        laid = int(layout.get("total_steps", total_steps)) if layout else total_steps
+        try:
+            from .nodes_joint import _LAST_SPLICE
+            extra = int(_LAST_SPLICE.get("prepend_steps") or 0) + int(_LAST_SPLICE.get("append_steps") or 0)
+        except Exception:
+            extra = 0
+        if layout and laid != total_steps and laid + extra != total_steps:
             raise ValueError(
                 "H3 Joint VAE Decode and Save: the latent has %d steps but the joint "
                 "layout describes %d. Wire the sampler that refined THIS "
-                "timeline." % (total_steps, int(layout["total_steps"])))
+                "timeline." % (total_steps, laid))
+        if extra and laid + extra == total_steps:
+            _LOG.info("obvpm.h3 render: latent is layout %d + %d splice steps",
+                      laid, extra)
         sound = decode_audio(audio_vae, audio)
         # the frames the cut SHOWS: a segment is laid out with a little
         # context around them (and a looping cut with the loop take's tail
@@ -380,12 +526,8 @@ class H3JointRender:
         # keeps only the shown frames
         keep = (layout or {}).get("keep_frames")
         lo, hi = (int(keep[0]), int(keep[1])) if keep else (0, frames)
-        if keep:
-            sr = int(sound["sample_rate"])
-            wf = sound["waveform"]
-            sound = {"waveform": wf[..., round(lo / fr.FPS * sr):
-                                     round(hi / fr.FPS * sr)],
-                     "sample_rate": sr}
+        # Audio is trimmed once in _write, after the splice shifts lo/hi.
+        # Trimming here and again there cut the soundtrack short.
         return {"video": video, "audio": audio, "frames": frames,
                 "keep": keep, "lo": lo, "hi": hi, "sound": sound}
 
@@ -413,7 +555,57 @@ class H3JointRender:
 
         blobs = nodes_save._workflow_blobs(prompt, extra_pnginfo)
         blocks = decode_windows(vae, video, window_steps)
-        if keep:
+        # Trim neighbor context spliced by H3 Attach Neighbor Context.
+        try:
+            from .nodes_joint import _LAST_SPLICE
+            pre_s = int(_LAST_SPLICE.get("prepend_steps") or 0)
+            app_s = int(_LAST_SPLICE.get("append_steps") or 0)
+        except Exception:
+            pre_s = app_s = 0
+        if pre_s or app_s:
+            pre_f = fr.frame_at_latent(pre_s)
+            app_f = fr.frame_at_latent(app_s) if app_s else 0
+            # keep_frames is in BODY coordinates. A prepend shifts the
+            # whole range forward; it must not also shrink the end.
+            # Head context shifts the body forward. Tail context (a
+            # prepend: the neighbor sits after the clip) must be cut off
+            # the end, or the take plays past its base clip.
+            if keep:
+                lo = int(keep[0]) + pre_f
+                hi = int(keep[1]) + pre_f
+            else:
+                lo = pre_f
+                hi = frames
+            # prepend: trim in pixel space only, after decode, and a few
+            # frames past the cut. The match sits just after the step the
+            # latent grid snapped to; the latent trim was cutting it off.
+            prepend = False
+            try:
+                from .nodes_joint import _LAST_SPLICE
+                shown = int(_LAST_SPLICE.get("shown_frames") or 0)
+                if shown and not pre_f:
+                    prepend = True
+                    # keep the start, drop the tail. The extra context
+                    # frames sit at the end; cutting the head shifted
+                    # the whole clip.
+                    lo = 0
+                    hi = min(frames, shown)
+                    _LOG.info("obvpm.h3 render: prepend trim frames %d..%d "
+                              "(tail dropped)", lo, hi)
+            except Exception:
+                pass
+            if app_f and not prepend:
+                hi = min(hi, frames - app_f)
+            _LOG.info("obvpm.h3 render: trimming splice context "
+                      "%d head / %d tail frames (composed with cut)", pre_f, app_f)
+            if sound and sound.get("waveform") is not None:
+                sr = int(sound["sample_rate"])
+                a0 = round(lo / fr.FPS * sr)
+                a1 = round(hi / fr.FPS * sr)
+                sound = {"waveform": sound["waveform"][..., a0:a1],
+                         "sample_rate": sr}
+            # leave _LAST_SPLICE for H3 Trim Attached Context; it clears
+        if keep or pre_s or app_s:
             from .nodes_joint import crop_blocks
             blocks = crop_blocks(blocks, lo, hi)
             _LOG.info("obvpm.h3 render: keeping frames %d..%d of %d%s", lo, hi,
