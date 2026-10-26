@@ -1385,7 +1385,34 @@ def delete_take(path):
         if os.path.isfile(f):
             os.remove(f)
             removed.append(os.path.relpath(f, root).replace(os.sep, "/"))
-    _LOG.info("obvpm.h3: deleted take %s", ", ".join(removed))
+    # Drop chain entries that point at this take. A shared multi-clip
+    # take is listed in every clip's chain; one delete clears them all.
+    take_name = os.path.basename(ap)
+    folder = os.path.dirname(ap)
+    dropped = 0
+    try:
+        from . import refine_chain as rc
+        for name in os.listdir(folder):
+            if not name.endswith(".refine_chain.json"):
+                continue
+            clip = os.path.join(folder, name[:-len(".refine_chain.json")] + ".mp4")
+            chain = rc.load_chain(clip)
+            if not chain:
+                continue
+            kept = [e for e in chain if e.get("take") != take_name]
+            if len(kept) != len(chain):
+                dropped += len(chain) - len(kept)
+                if kept:
+                    rc.save_chain(clip, kept)
+                else:
+                    try:
+                        os.remove(rc.chain_path(clip))
+                    except OSError:
+                        pass
+    except Exception as exc:
+        _LOG.warning("obvpm.h3: chain cleanup after delete failed: %s", exc)
+    _LOG.info("obvpm.h3: deleted take %s (chain entries removed: %d)",
+              ", ".join(removed), dropped)
     return removed
 
 
