@@ -8561,6 +8561,16 @@ app.registerExtension({
                             const currentTake = (pass) => {
                                 const list = takesOf(pass);
                                 if (!list.length) return null;
+                                // Same file used twice (split parts): match the
+                                // chain entry whose conversion.part_id equals
+                                // this sequence line's part, so each part gets
+                                // its own frame_layout instead of the last entry.
+                                if (e.part) {
+                                    const byPart = list.find((t) =>
+                                        t.ent && t.ent.conversion
+                                        && t.ent.conversion.part_id === e.part);
+                                    if (byPart) return byPart;
+                                }
                                 const clipKey = e.clip;
                                 node.obvpmPassTake[clipKey] = node.obvpmPassTake[clipKey] || {};
                                 let i = node.obvpmPassTake[clipKey][pass];
@@ -8689,18 +8699,29 @@ app.registerExtension({
                                             playlist[i]._baseExit = playlist[i].exit;
                                         }
                                         // play the take (same folder assumed)
-                                        // Do NOT overwrite enter/exit: chain layout is
-                                        // latent steps, not timeline frames. Keeping the
-                                        // original cut stops the playhead from collapsing.
                                         const baseDir = e.clip.includes("/")
                                             ? e.clip.slice(0, e.clip.lastIndexOf("/") + 1)
                                             : "";
                                         playlist[i].clip = baseDir + ent.take;
-                                        // the file is already trimmed to the
-                                        // join, so play it from the start;
-                                        // the base enter would skip into it
-                                        playlist[i].enter = 0;
-                                        playlist[i].exit = null;
+                                        // M4: one-clip takes stay exactly as before
+                                        // (enter=0, exit=null — the file is already
+                                        // the trimmed body). Shared multi-clip takes
+                                        // use the recorded frame_layout so the
+                                        // timeline shows only this clip's portion of
+                                        // the joint video.
+                                        const fl = ent.frame_layout;
+                                        if (ent.shared && Array.isArray(fl) && fl.length === 2) {
+                                            const a = Number(fl[0]) || 0;
+                                            const b = Number(fl[1]);
+                                            playlist[i].enter = a;
+                                            playlist[i].exit = (b > a) ? b : null;
+                                        } else {
+                                            // the file is already trimmed to the
+                                            // join, so play it from the start;
+                                            // the base enter would skip into it
+                                            playlist[i].enter = 0;
+                                            playlist[i].exit = null;
+                                        }
                                     }
                                 }
                                 // force a reload of this item on next play

@@ -364,20 +364,26 @@ class H3JointRender:
                 raise RuntimeError("H3 Joint VAE Decode and Save: %s. The upscale "
                                    "itself was saved: %s" % (exc, cut_path)) from None
         # M1: record the refine chain for the source clips
+        # M4: for multi-segment jobs, record the per-segment take (and its
+        # .mctx) so each clip's layout coordinates match the file that is
+        # loaded later. Single-segment / single-clip stays on cut_path.
         try:
             refine_chain.check_green_compatibility(layouts)
-            # determine the take path to record (cut or segment)
-            take_to_record = cut_path
+            # map segment index -> written take path (multi-segment only)
+            seg_paths = {}
             if not single:
-                # for multi-segment, record the cut_path as the group take;
-                # individual segment takes are also valid but the cut is the
-                # joined result the user sees
-                take_to_record = cut_path
-            seed = refine_chain.seed_from_sidecar(take_to_record)
+                for p in parts:
+                    if not _is_gap(p) and "segment" in p and p.get("path"):
+                        seg_paths[int(p["segment"])] = p["path"]
+            seed = None
             denoise = None
             megapixels = None
-            bn = os.path.basename(take_to_record).lower()
+            # seed / pass detection still comes from the joined cut (or the
+            # single take) so one-clip behaviour is unchanged
+            take_for_meta = cut_path
+            bn = os.path.basename(take_for_meta).lower()
             pass_num = 2 if "pass2" in bn or "pass_2" in bn else 1
+            seed = refine_chain.seed_from_sidecar(take_for_meta)
             # Prefer the options/seed node that matches THIS pass
             def matches_pass(title):
                 t = title.lower()
@@ -414,13 +420,27 @@ class H3JointRender:
                                 break
             _LOG.info("obvpm.h3 chain: take=%s seed=%s denoise=%s mp=%s pass=%s job=%s",
                       bn, seed, denoise, megapixels, pass_num, _job_id(prompt))
-            for lay in layouts or []:
+            for k, lay in enumerate(layouts or []):
                 clips = lay.get("clips") or []
                 steps = lay.get("steps") or []
+                # M4: use the segment take when this job was multi-segment;
+                # single-segment / single-clip continues to use cut_path.
+                take_to_record = seg_paths.get(k, cut_path) if not single else cut_path
+                shared = len(clips) > 1
+                conv = lay.get("conversion") or {}
+                conv_list = conv.get("clips") or []
+                # Prefer the conversion record's output range (built from the
+                # layout). Index-aligned so the same file used twice (split
+                # parts) keeps its own range. Fall back to a zero range only
+                # if it is missing.
                 for i, clip in enumerate(clips):
                     if i >= len(steps):
                         break
                     start, length = steps[i]
+                    crec = conv_list[i] if i < len(conv_list) else {}
+                    out = crec.get("output") or {}
+                    f0 = int(out.get("mp4_enter", 0) or 0)
+                    f1 = int(out.get("mp4_exit", f0) or f0)
                     stem = os.path.splitext(os.path.basename(take_to_record))[0]
                     # matching sidecars (same stem, same folder)
                     folder = os.path.dirname(take_to_record)
@@ -447,12 +467,9 @@ class H3JointRender:
                                     break
                     except Exception:
                         ctx_frames = 0
-                    try:
-                        import frames as _fr
-                    except ImportError:
-                        from . import frames as _fr
-                    f0 = _fr.frame_at_latent(int(start)) if hasattr(_fr, "frame_at_latent") else int(start)
-                    f1 = _fr.frame_at_latent(int(start + length)) if hasattr(_fr, "frame_at_latent") else int(start + length)
+                    # f0/f1 already computed above as the visible range
+                    # in the finished MP4 (sequential). layout stays the
+                    # step range for latent slicing.
                     entry = {
                         "take": os.path.basename(take_to_record),
                         "frame_layout": [int(f0), int(f1)],
@@ -466,12 +483,16 @@ class H3JointRender:
                         "megapixels": megapixels,
                         "group": stem,
                         "pass": pass_num,
+                        "shared": bool(shared),
+                        "conversion": crec or None,
                         "grafted_from": _grafted_from(clip),
                         "job_id": _job_id(prompt),
                     }
                     refine_chain.append_entry(clip, entry)
-                    _LOG.info("obvpm.h3: recorded refine chain entry for %s -> %s",
-                              os.path.basename(clip), entry["take"])
+                    _LOG.info("obvpm.h3: recorded refine chain entry for %s -> %s "
+                              "frame_layout=%s shared=%s",
+                              os.path.basename(clip), entry["take"],
+                              entry.get("frame_layout"), entry.get("shared"))
         except Exception as exc:
             _LOG.warning("obvpm.h3: refine chain write skipped: %s", exc)
         return (cut_path,)

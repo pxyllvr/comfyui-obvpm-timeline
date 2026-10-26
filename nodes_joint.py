@@ -1088,6 +1088,33 @@ def _load(clips, refine_map=None, prefer_newest=True):
             side = mctx.sidecar_path(take_path)
             if os.path.isfile(side):
                 v, a, _ = mctx.load_sidecar(side)
+                # M4: when this clip was part of a multi-clip upscale the
+                # refined latent is the whole joint/segment. Slice to the
+                # range recorded in the chain so later jobs see only this
+                # clip's portion. One-clip takes have start==0 and length
+                # matching the whole latent, so the slice is a no-op.
+                lay = ent.get("layout")
+                if isinstance(lay, (list, tuple)) and len(lay) >= 2:
+                    try:
+                        start = max(0, int(lay[0]))
+                        end = int(lay[1])
+                        full = int(v.shape[2])
+                        end = min(full, max(start, end))
+                        if start > 0 or end < full:
+                            v_orig_steps = full
+                            v = v[:, :, start:end]
+                            if a is not None and getattr(a, "shape", None) and a.shape[-1] > 0:
+                                a0 = int(a.shape[-1] * start / max(v_orig_steps, 1))
+                                a1 = int(a.shape[-1] * end / max(v_orig_steps, 1))
+                                a1 = max(a0, min(a.shape[-1], a1))
+                                a = a[..., a0:a1]
+                            _LOG.info("obvpm.h3 joint: sliced refined %s for %s "
+                                      "to steps %d..%d (shared=%s)",
+                                      ent.get("take"), os.path.basename(clip),
+                                      start, end, bool(ent.get("shared")))
+                    except (TypeError, ValueError, IndexError) as exc:
+                        _LOG.warning("obvpm.h3 joint: layout slice skipped for %s: %s",
+                                     os.path.basename(clip), exc)
                 _LOG.info("obvpm.h3 joint: %s -> refined %s",
                           os.path.basename(clip), ent["take"])
             else:
@@ -1125,6 +1152,131 @@ def _load(clips, refine_map=None, prefer_newest=True):
         videos.append(v)
         audios.append(a)
     return videos, audios
+
+
+def _owner_digest(owner_steps):
+    """Collapse owner_steps into 'idx:count,idx:count' runs."""
+    if not owner_steps:
+        return ""
+    runs = []
+    cur, n = owner_steps[0], 1
+    for o in owner_steps[1:]:
+        if o == cur:
+            n += 1
+        else:
+            runs.append("%d:%d" % (cur, n))
+            cur, n = o, 1
+    runs.append("%d:%d" % (cur, n))
+    return ",".join(runs)
+
+
+def build_conversion(layout, clips, lines, headers, cuts, keep_frames,
+                     job_id=None, take=None, segment=0, segments=1):
+    """Conversion record for one segment.
+
+    Built from the (cropped) layout so later stages do not re-derive cuts.
+    output ranges are the sequential shown frames in the finished MP4.
+    placement.steps may overlap; output ranges must not.
+    """
+    # fr is the package frames module, already imported at module top
+    starts = layout.get("starts") or []
+    heads = layout.get("heads") or []
+    steps = layout.get("steps") or []
+    owner = layout.get("owner_steps") or []
+    crop = layout.get("crop") or {}
+    keep = list(keep_frames or [0, 0])
+    mp4_frames = max(0, int(keep[1]) - int(keep[0])) if len(keep) >= 2 else 0
+
+    clip_recs = []
+    vis_offset = 0
+    prev_end = None
+    for i, clip in enumerate(clips):
+        header = headers[i] if i < len(headers) else {}
+        cut = cuts[i] if i < len(cuts) else [None, None]
+        enter = int(cut[0] or 0)
+        exit_ = cut[1]
+        if exit_ is None:
+            exit_ = int(header.get("delivered_frames", 0) or 0)
+        else:
+            exit_ = int(exit_)
+        shown = max(0, exit_ - enter)
+        raw_start = int(starts[i]) if i < len(starts) else 0
+        head = int(heads[i]) if i < len(heads) else 0
+        joint_frame = raw_start + head + enter
+        st = steps[i] if i < len(steps) else (0, 0)
+        placed = [int(st[0]), int(st[0]) + int(st[1])]
+        on_grid = fr.steps_for_frames(shown) is not None
+        overlaps = 0
+        if prev_end is not None and placed[0] < prev_end:
+            overlaps = prev_end - placed[0]
+        prev_end = placed[1]
+        part = None
+        if isinstance(lines[i] if i < len(lines) else "", str) and "[id=" in (lines[i] if i < len(lines) else ""):
+            try:
+                part = lines[i].split("[id=")[1].split("]")[0]
+            except Exception:
+                part = None
+        # Output range is where this clip's shown content sits in the
+        # finished MP4 (joint_frame), not a running sum of durations.
+        # Shared latents (same file, different cuts) place later parts
+        # at their real joint offset; a running sum ends short of the file.
+        clip_recs.append({
+            "clip": clip,
+            "part_id": part,
+            "index": i,
+            "source": {
+                "raw_frames": int(header.get("raw_frames", 0) or 0),
+                "delivered_frames": int(header.get("delivered_frames", 0) or 0),
+                "pinned_head_frames": int(header.get("pinned_head_frames", 0) or 0),
+            },
+            "cut": {
+                "text": [cut[0], cut[1]],
+                "shown": [enter, exit_],
+                "shown_frames": shown,
+            },
+            "placement": {
+                "raw_start": raw_start,
+                "head": head,
+                "joint_frame": joint_frame,
+                "steps": placed,
+                "on_grid": bool(on_grid),
+                "overlaps_prev_steps": int(overlaps),
+            },
+            "output": {
+                "mp4_enter": joint_frame,
+                "mp4_exit": joint_frame + shown,
+                "mp4_frames": shown,
+            },
+        })
+        vis_offset += shown
+
+    return {
+        "version": 1,
+        "job_id": job_id,
+        "take": take,
+        "shared": len(clips) > 1,
+        "segment": int(segment),
+        "segments": int(segments),
+        "grid": {
+            "frame_per_token": list(fr.FRAME_PER_TOKEN),
+            "frames_per_group": fr.FRAMES_PER_GROUP,
+            "latents_per_group": fr.LATENTS_PER_GROUP,
+            "frame_base": fr.FRAME_BASE,
+            "latent_base": fr.LATENT_BASE,
+            "fps": fr.FPS,
+        },
+        "joint": {
+            "total_steps": int(layout.get("total_steps", 0) or 0),
+            "total_frames": int(layout.get("total_frames", 0) or 0),
+            "crop": crop,
+            "keep_frames": [int(keep[0]), int(keep[1])] if len(keep) >= 2 else [0, 0],
+            "mp4_frames": mp4_frames,
+            "owner_steps_digest": _owner_digest(owner),
+            "shown_sum": vis_offset,
+        },
+        "clips": clip_recs,
+    }
+
 
 class H3JointLatent:
     """The timeline's clips, laid onto one latent at their true positions."""
@@ -1244,8 +1396,24 @@ class H3JointLatent:
         layout = crop_layout(layout, cs, ce)
         cs_f = layout["crop"]["frames"][0]
         video, audio = assemble(videos, audios, layout)
+        keep = [lo - cs_f, hi - cs_f]
         record = dict(layout, clips=list(clips), lines=list(lines),
-                      keep_frames=[lo - cs_f, hi - cs_f])
+                      keep_frames=keep)
+        try:
+            record["conversion"] = build_conversion(
+                layout, list(clips), list(lines), headers, cuts, keep)
+            conv = record["conversion"]
+            _LOG.info("obvpm.h3 joint: conversion v%d shared=%s mp4=%d shown_sum=%d digest=%s",
+                      conv.get("version"), conv.get("shared"),
+                      conv["joint"]["mp4_frames"], conv["joint"]["shown_sum"],
+                      conv["joint"]["owner_steps_digest"])
+            for c in conv["clips"]:
+                _LOG.info("obvpm.h3 joint:   %s shown=%s steps=%s mp4=%s..%s grid=%s",
+                          os.path.basename(c["clip"]), c["cut"]["shown"],
+                          c["placement"]["steps"], c["output"]["mp4_enter"],
+                          c["output"]["mp4_exit"], c["placement"]["on_grid"])
+        except Exception as exc:
+            _LOG.warning("obvpm.h3 joint: conversion record failed: %s", exc)
         info = "\n".join(
             "%s: steps %d..%d, ticks %d..%d"
             % (clip, s, s + n, t, t + m)
@@ -2785,27 +2953,21 @@ class H3AttachNeighborContext:
                                   "(frame %d shown)", cut, shown)
                 except Exception:
                     pass
-                # a pure prepend has no left neighbour, so the body needs a
-                # head copy to be sampled from, the way an extend works.
-                # A bridge already has its left neighbour at the head, and
-                # head-only is enough there: cheaper, and it holds.
-                pure_prepend = target_i == 0
-                if pure_prepend:
-                    vparts.insert(0, v[:, :, start:start + n])
-                    names.insert(0, name)
-                    if a is not None:
-                        an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
-                        aparts.insert(0, a[..., :an])
-                    _LAST_SPLICE["prepend_steps"] = n
-                # the tail anchors the end for a prepend. A bridge stays
-                # head-only: its left neighbour already covers the head,
-                # and a tail copy costs a window for nothing.
-                if pure_prepend:
-                    vparts.append(v[:, :, start:start + n])
-                    if a is not None:
-                        an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
-                        aparts.append(a[..., :an])
-                    names.append(name)
+                # the neighbour's frames at the head too, so the body is
+                # generated continuing from them, the way an extend works.
+                # The head is trimmed off; only the body is kept.
+                vparts.insert(0, v[:, :, start:start + n])
+                names.insert(0, name)
+                if a is not None:
+                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
+                    aparts.insert(0, a[..., :an])
+                _LAST_SPLICE["prepend_steps"] = n
+                # and at the tail, to anchor the end
+                vparts.append(v[:, :, start:start + n])
+                if a is not None:
+                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
+                    aparts.append(a[..., :an])
+                names.append(name)
             elif v is not None:
                 _LOG.info("obvpm.h3 attach: right %s is %s, upscaled is %s; skipped",
                           name, tuple(v.shape[3:]), tuple(video.shape[3:]))
