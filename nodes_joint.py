@@ -2785,21 +2785,27 @@ class H3AttachNeighborContext:
                                   "(frame %d shown)", cut, shown)
                 except Exception:
                     pass
-                # the neighbour's frames at the head too, so the body is
-                # generated continuing from them, the way an extend works.
-                # The head is trimmed off; only the body is kept.
-                vparts.insert(0, v[:, :, start:start + n])
-                names.insert(0, name)
-                if a is not None:
-                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
-                    aparts.insert(0, a[..., :an])
-                _LAST_SPLICE["prepend_steps"] = n
-                # and at the tail, to anchor the end
-                vparts.append(v[:, :, start:start + n])
-                if a is not None:
-                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
-                    aparts.append(a[..., :an])
-                names.append(name)
+                # a pure prepend has no left neighbour, so the body needs a
+                # head copy to be sampled from, the way an extend works.
+                # A bridge already has its left neighbour at the head, and
+                # head-only is enough there: cheaper, and it holds.
+                pure_prepend = target_i == 0
+                if pure_prepend:
+                    vparts.insert(0, v[:, :, start:start + n])
+                    names.insert(0, name)
+                    if a is not None:
+                        an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
+                        aparts.insert(0, a[..., :an])
+                    _LAST_SPLICE["prepend_steps"] = n
+                # the tail anchors the end for a prepend. A bridge stays
+                # head-only: its left neighbour already covers the head,
+                # and a tail copy costs a window for nothing.
+                if pure_prepend:
+                    vparts.append(v[:, :, start:start + n])
+                    if a is not None:
+                        an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
+                        aparts.append(a[..., :an])
+                    names.append(name)
             elif v is not None:
                 _LOG.info("obvpm.h3 attach: right %s is %s, upscaled is %s; skipped",
                           name, tuple(v.shape[3:]), tuple(video.shape[3:]))
