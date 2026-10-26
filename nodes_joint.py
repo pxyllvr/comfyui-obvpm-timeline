@@ -2991,6 +2991,28 @@ class H3AttachNeighborContext:
                     body = body.clone()
                     body[:, :, cut:cut + nn] = sl[:, :, :nn]
                     vparts[body_i] = body
+                    # Matching audio: parent's ticks at the same frames,
+                    # written into the body at the cut.
+                    try:
+                        if a is not None and aparts[body_i] is not None:
+                            a_lo = fr.audio_total(fr.frame_at_latent(start))
+                            a_hi = fr.audio_total(fr.frame_at_latent(start + nn))
+                            b_at = fr.audio_total(fr.frame_at_latent(cut))
+                            a_len = max(0, a_hi - a_lo)
+                            ba = aparts[body_i]
+                            a_len = min(a_len, a.shape[-1] - a_lo, ba.shape[-1] - b_at)
+                            if a_len > 0:
+                                ba = ba.clone()
+                                ba[..., b_at:b_at + a_len] = a[..., a_lo:a_lo + a_len].to(
+                                    ba.device, ba.dtype)
+                                aparts[body_i] = ba
+                                _LAST_SPLICE["audio_hold_at"] = int(b_at)
+                                _LAST_SPLICE["audio_hold_len"] = int(a_len)
+                                _LOG.info("obvpm.h3 attach: prepend audio "
+                                          "hard-held %d ticks at %d from %d",
+                                          a_len, b_at, a_lo)
+                    except Exception as exc:
+                        _LOG.info("obvpm.h3 attach: audio hold skipped: %s", exc)
                     _LOG.info("obvpm.h3 attach: prepend hard-held %d steps "
                               "at cut step %d (body %d) from step %d of %s",
                               nn, cut, body.shape[2], start, name)
@@ -3021,9 +3043,16 @@ class H3AttachNeighborContext:
                     out_a = aparts[0]
                     vm = torch.ones((1, 1) + tuple(out_v.shape[2:]),
                                     device=out_v.device, dtype=torch.float32)
-                    am = torch.ones((1, 1) + tuple(out_a.shape[2:]),
+                    # Junction frozen, rest of audio keeps the joint's soft hold.
+                    am = torch.full((1, 1) + tuple(out_a.shape[2:]), 0.35,
                                     device=out_a.device, dtype=torch.float32)
                     vm[:, :, hold_at:hold_at + hold_len] = 0
+                    a_at = _LAST_SPLICE.pop("audio_hold_at", None)
+                    a_len = _LAST_SPLICE.pop("audio_hold_len", 0)
+                    if a_at is not None and a_len:
+                        am[..., a_at:a_at + a_len] = 0
+                        _LOG.info("obvpm.h3 attach: audio hold mask on ticks %d..%d",
+                                  a_at, a_at + a_len)
                     packed["noise_mask"] = comfy.nested_tensor.NestedTensor((vm, am))
                     _LOG.info("obvpm.h3 attach: hold mask on steps %d..%d",
                               hold_at, hold_at + hold_len)
