@@ -2953,27 +2953,83 @@ class H3AttachNeighborContext:
                                   "(frame %d shown)", cut, shown)
                 except Exception:
                     pass
-                # the neighbour's frames at the head too, so the body is
-                # generated continuing from them, the way an extend works.
-                # The head is trimmed off; only the body is kept.
-                vparts.insert(0, v[:, :, start:start + n])
-                names.insert(0, name)
-                if a is not None:
-                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
-                    aparts.insert(0, a[..., :an])
-                _LAST_SPLICE["prepend_steps"] = n
-                # and at the tail, to anchor the end
-                vparts.append(v[:, :, start:start + n])
-                if a is not None:
-                    an = max(1, int(a.shape[-1] * n / max(v.shape[2], 1)))
-                    aparts.append(a[..., :an])
-                names.append(name)
+                # Single inject at the body/parent junction (the body's
+                # tail), not a separate part on both ends. Prefer the
+                # parent's conversion record for the offset; fall back to
+                # the pin-derived start above.
+                try:
+                    pchain = refine_chain.load_chain(clips[target_i + 1])
+                    pent = next((e for e in reversed(pchain or [])
+                                 if e.get("conversion") and e.get("take")), None)
+                    if pent and pent["conversion"].get("output"):
+                        mf = int(pent["conversion"]["output"].get("mp4_enter") or 0)
+                        if mf > 0:
+                            start = 0
+                            while fr.frame_at_latent(start + 1) <= mf:
+                                start += 1
+                            start = min(start, max(0, v.shape[2] - n))
+                            _LOG.info("obvpm.h3 attach: prepend offset from "
+                                      "conversion mp4_enter=%d -> step %d",
+                                      mf, start)
+                except Exception as exc:
+                    _LOG.info("obvpm.h3 attach: conversion offset skipped: %s", exc)
+                # Blend the parent's slice into the body starting at the
+                # cut (where shown content ends), not at length-n. The
+                # cut is the junction; length-n lands inside the body.
+                import torch
+                body_i = names.index("upscaled") if "upscaled" in names else 0
+                body = vparts[body_i]
+                cut = _LAST_SPLICE.get("cut_step")
+                if not isinstance(cut, int) or cut <= 0 or cut >= body.shape[2]:
+                    cut = max(0, body.shape[2] - n)
+                sl = v[:, :, start:start + n].to(body.device, body.dtype)
+                nn = min(n, body.shape[2] - cut, sl.shape[2])
+                if nn > 0:
+                    # Hard hold: every step is fully the parent's slice,
+                    # no ramp. The denoise mask freezes them, so the
+                    # sampler sees pure neighbor context at the junction.
+                    body = body.clone()
+                    body[:, :, cut:cut + nn] = sl[:, :, :nn]
+                    vparts[body_i] = body
+                    _LOG.info("obvpm.h3 attach: prepend hard-held %d steps "
+                              "at cut step %d (body %d) from step %d of %s",
+                              nn, cut, body.shape[2], start, name)
+                    # Freeze the blended stretch so the sampler's windows
+                    # don't overwrite it. Same mechanism as the extend hold.
+                    _LAST_SPLICE["hold_at"] = int(cut)
+                    _LAST_SPLICE["hold_len"] = int(nn)
+                    _LOG.info("obvpm.h3 attach: holding steps %d..%d",
+                              cut, cut + nn)
+                _LAST_SPLICE["prepend_steps"] = 0
             elif v is not None:
                 _LOG.info("obvpm.h3 attach: right %s is %s, upscaled is %s; skipped",
                           name, tuple(v.shape[3:]), tuple(video.shape[3:]))
         if len(vparts) == 1:
             _LAST_SPLICE["prepend_steps"] = 0
             _LAST_SPLICE["append_steps"] = 0
+            # A prepend blend writes into the body in place and adds no
+            # part, so vparts is still length 1. Pack it; do not return
+            # the original latent or the blend is lost.
+            if vparts[0] is not video:
+                import torch
+                import comfy.nested_tensor
+                packed = avpack.pack_av(vparts[0], aparts[0], name="attach")
+                hold_at = _LAST_SPLICE.pop("hold_at", None)
+                hold_len = _LAST_SPLICE.pop("hold_len", 0)
+                if hold_at is not None and hold_len:
+                    out_v = vparts[0]
+                    out_a = aparts[0]
+                    vm = torch.ones((1, 1) + tuple(out_v.shape[2:]),
+                                    device=out_v.device, dtype=torch.float32)
+                    am = torch.ones((1, 1) + tuple(out_a.shape[2:]),
+                                    device=out_a.device, dtype=torch.float32)
+                    vm[:, :, hold_at:hold_at + hold_len] = 0
+                    packed["noise_mask"] = comfy.nested_tensor.NestedTensor((vm, am))
+                    _LOG.info("obvpm.h3 attach: hold mask on steps %d..%d",
+                              hold_at, hold_at + hold_len)
+                _LOG.info("obvpm.h3 attach: prepend blend packed (%d steps)",
+                          vparts[0].shape[2])
+                return (packed,)
             _LOG.info("obvpm.h3 attach: no matching-pass neighbor at %s",
                       tuple(video.shape[3:]))
             return (latent,)
